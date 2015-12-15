@@ -41,3 +41,6 @@ gst-mmal-*.tar*
 /m4/lt~obsolete.m4
 Makefile.in
 Makefile
+.project
+.cproject
+.settings

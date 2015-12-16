@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015, YouView TV Ltd.
+ * Copyright (C) 2015, YouView TV Ltd
  *   Author: Krzysztof Konopko <kris@youview.com>
  *
  * This library is free software; you can redistribute it and/or
@@ -18,26 +18,24 @@
  *
  */
 
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
+#ifndef __GST_MMAL_VIDEO_SINK_H__
+#define __GST_MMAL_VIDEO_SINK_H__
 
-#include "gstmmalvideosink.h"
+#include <gst/gst.h>
 
-static gboolean
-plugin_init (GstPlugin * plugin)
-{
-  if (!gst_element_register (plugin, "mmalvideosink", GST_RANK_NONE,
-          GST_TYPE_MMAL_VIDEO_SINK)) {
-    return FALSE;
-  }
+G_BEGIN_DECLS
 
-  return TRUE;
-}
+#define GST_TYPE_MMAL_VIDEO_SINK \
+  (gst_mmal_video_sink_get_type())
 
-GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,
-    GST_VERSION_MINOR,
-    mmal,
-    "GStreamer MMAL Plug-ins",
-    plugin_init,
-    PACKAGE_VERSION, GST_LICENSE, GST_PACKAGE_NAME, GST_PACKAGE_ORIGIN)
+#define GST_IS_MMAL_VIDEO_SINK(obj) \
+  (G_TYPE_CHECK_INSTANCE_TYPE((obj), GST_TYPE_MMAL_VIDEO_SINK))
+
+#define GST_IS_MMAL_VIDEO_SINK_CLASS(obj) \
+  (G_TYPE_CHECK_CLASS_TYPE((klass), GST_TYPE_MMAL_VIDEO_SINK))
+
+GType gst_mmal_video_sink_get_type (void);
+
+G_END_DECLS
+
+#endif /* __GST_MMAL_VIDEO_SINK_H__ */

@@ -1,9 +1,11 @@
 plugin_LTLIBRARIES = libgstmmal.la
 
 libgstmmal_la_SOURCES = \
-	gstmmal.c
+	gstmmal.c \
+	gstmmalvideosink.c
 
-noinst_HEADERS =
+noinst_HEADERS = \
+	gstmmalvideosink.h
 
 libgstmmal_la_CFLAGS = \
 	$(GST_PLUGINS_BASE_CFLAGS) \

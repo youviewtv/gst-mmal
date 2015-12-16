@@ -2,9 +2,13 @@ plugin_LTLIBRARIES = libgstmmal.la
 
 libgstmmal_la_SOURCES = \
 	gstmmal.c \
+	gstmmalh264dec.c \
+	gstmmalvideodec.c \
 	gstmmalvideosink.c
 
 noinst_HEADERS = \
+	gstmmalh264dec.h \
+	gstmmalvideodec.h \
 	gstmmalvideosink.h
 
 # N.B. the `-fgnu89-inline` is there to suppress annoying "inline function

@@ -1,6 +1,7 @@
 /*
  * Copyright (C) 2015, YouView TV Ltd.
  *   Author: Krzysztof Konopko <kris@youview.com>
+ *           John Sadler <john.sadler@youview.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -22,11 +23,19 @@
 #include "config.h"
 #endif
 
+#include "gstmmalh264dec.h"
 #include "gstmmalvideosink.h"
+
+#include <gst/gst.h>
 
 static gboolean
 plugin_init (GstPlugin * plugin)
 {
+  if (!gst_element_register (plugin, "mmalh264dec",
+          GST_RANK_PRIMARY + 1, GST_TYPE_MMAL_H264_DEC)) {
+    return FALSE;
+  }
+
   if (!gst_element_register (plugin, "mmalvideosink", GST_RANK_NONE,
           GST_TYPE_MMAL_VIDEO_SINK)) {
     return FALSE;

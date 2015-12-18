@@ -14,6 +14,8 @@ libgstmmal_la_CFLAGS = \
 	$(GMODULE_NO_EXPORT_CFLAGS)
 
 libgstmmal_la_LIBADD = \
+	-lbcm_host \
+	-lmmal \
 	$(GST_PLUGINS_BASE_LIBS) \
 	-lgstaudio-@GST_API_VERSION@ \
 	-lgstpbutils-@GST_API_VERSION@ \

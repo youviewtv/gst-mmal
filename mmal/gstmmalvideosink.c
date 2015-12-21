@@ -35,6 +35,10 @@
 
 #define ARBITRARY_BUFFER_NUM 5
 
+#define MMAL_I420_STRIDE_ALIGN 32
+#define MMAL_I420_WIDTH_ALIGN GST_ROUND_UP_32
+#define MMAL_I420_HEIGHT_ALIGN GST_ROUND_UP_16
+
 #define GST_MMAL_VIDEO_SINK(obj) \
   (G_TYPE_CHECK_INSTANCE_CAST((obj), GST_TYPE_MMALVIDEOSINK, GstMMALVideoSink))
 
@@ -48,7 +52,8 @@ struct _GstMMALVideoSink
 {
   GstVideoSink sink;
 
-  GstVideoInfo info;
+  GstVideoInfo vinfo;
+  GstVideoInfo *vinfo_padded;
 
   MMAL_COMPONENT_T *renderer;
   MMAL_POOL_T *pool;
@@ -160,16 +165,16 @@ mmal_input_port_cb (MMAL_PORT_T * port, MMAL_BUFFER_HEADER_T * buffer)
   } else {
     MappedBuffer *mb = (MappedBuffer *) buffer->user_data;
 
-    g_return_if_fail (mb != NULL);
+    if (mb) {
+      gst_buffer_unmap (mb->buffer, &mb->map_info);
+      gst_buffer_unref (mb->buffer);
 
-    gst_buffer_unmap (mb->buffer, &mb->map_info);
-    gst_buffer_unref (mb->buffer);
-
-    /*
-     * Restore original MMAL buffer payload we used for storing buffer info
-     */
-    buffer->data = mb;
-    buffer->length = buffer->alloc_size = sizeof (*mb);
+      /*
+       * Restore original MMAL buffer payload we used for storing buffer info
+       */
+      buffer->data = (uint8_t *) mb;
+      buffer->length = buffer->alloc_size = sizeof (*mb);
+    }
   }
 
   mmal_buffer_header_release (buffer);
@@ -180,7 +185,8 @@ gst_mmal_video_sink_init (GstMMALVideoSink * self)
 {
   g_return_if_fail (self != NULL);
 
-  gst_video_info_init (&self->info);
+  gst_video_info_init (&self->vinfo);
+  self->vinfo_padded = NULL;
 
   self->renderer = NULL;
   self->pool = NULL;
@@ -190,23 +196,49 @@ static gboolean
 gst_mmal_video_sink_set_caps (GstBaseSink * sink, GstCaps * caps)
 {
   GstMMALVideoSink *self = NULL;
-  GstVideoInfo info_new;
+  GstVideoInfo vinfo;
+  GstVideoAlignment align;
 
   g_return_val_if_fail (sink != NULL, FALSE);
 
   self = GST_MMAL_VIDEO_SINK (sink);
   GST_DEBUG_OBJECT (self, "set caps: %" GST_PTR_FORMAT, caps);
 
-  if (!gst_video_info_from_caps (&info_new, caps)) {
+  if (!gst_video_info_from_caps (&vinfo, caps)) {
     GST_ERROR_OBJECT (self, "Could not turn caps into video info");
     return FALSE;
   }
 
-  if (gst_video_info_is_equal (&info_new, &self->info)) {
+  if (gst_video_info_is_equal (&vinfo, &self->vinfo)) {
     return TRUE;
   }
 
-  self->info = info_new;
+  self->vinfo = vinfo;
+  if (self->vinfo_padded) {
+    gst_video_info_free (self->vinfo_padded);
+    self->vinfo_padded = NULL;
+  }
+
+  gst_video_alignment_reset (&align);
+
+  align.padding_bottom =
+      MMAL_I420_HEIGHT_ALIGN (GST_VIDEO_INFO_HEIGHT (&vinfo)) -
+      GST_VIDEO_INFO_HEIGHT (&vinfo);
+  align.padding_right =
+      MMAL_I420_WIDTH_ALIGN (GST_VIDEO_INFO_WIDTH (&vinfo)) -
+      GST_VIDEO_INFO_WIDTH (&vinfo);
+
+  align.stride_align[0] = MMAL_I420_STRIDE_ALIGN - 1;
+  align.stride_align[1] = (MMAL_I420_STRIDE_ALIGN / 2) - 1;
+  align.stride_align[2] = (MMAL_I420_STRIDE_ALIGN / 2) - 1;
+
+  gst_video_info_align (&vinfo, &align);
+  if (!gst_video_info_is_equal (&vinfo, &self->vinfo)) {
+    GST_VIDEO_INFO_WIDTH (&vinfo) += align.padding_right;
+    GST_VIDEO_INFO_HEIGHT (&vinfo) += align.padding_bottom;
+
+    self->vinfo_padded = gst_video_info_copy (&vinfo);
+  }
 
   return gst_mmal_video_sink_configure_renderer (self);
 }
@@ -215,7 +247,6 @@ static gboolean
 gst_mmal_video_sink_start (GstBaseSink * sink)
 {
   MMAL_STATUS_T status;
-  MMAL_PORT_T *input = NULL;
 
   GstMMALVideoSink *self = NULL;
 
@@ -223,6 +254,8 @@ gst_mmal_video_sink_start (GstBaseSink * sink)
 
   self = GST_MMAL_VIDEO_SINK (sink);
   GST_DEBUG_OBJECT (self, "start");
+
+  gst_video_info_init (&self->vinfo);
 
   bcm_host_init ();
 
@@ -235,32 +268,6 @@ gst_mmal_video_sink_start (GstBaseSink * sink)
         "Failed to create MMAL renderer component %s: %s (%u)",
         MMAL_COMPONENT_DEFAULT_VIDEO_RENDERER,
         mmal_status_to_string (status), status);
-    return FALSE;
-  }
-
-  g_return_val_if_fail (self->renderer != NULL, FALSE);
-  g_return_val_if_fail (self->renderer->input != NULL, FALSE);
-
-  input = self->renderer->input[0];
-  g_return_val_if_fail (input != NULL, FALSE);
-
-  self->pool = mmal_port_pool_create (input,
-      /*
-       * This really simplifies things as we don't need to reallocate/resize the
-       * pool and do all the buffers-in-transit dance (would need to wait for
-       * buffers in use to be returned?).  Maybe this is not so complicated and
-       * we could still use suggested buffer_num on input port?  Also depends on
-       * how we use buffer payload (see below).
-       */
-      ARBITRARY_BUFFER_NUM,
-      /*
-       * Here we use MMAL buffer payload for storing mapped GStreamer buffer
-       * information as we pass GStreamer buffer data directly to MMAL without
-       * copying it.
-       */
-      sizeof (MappedBuffer));
-  if (!self->pool) {
-    GST_ERROR_OBJECT (self, "Failer to create port buffer pool");
     return FALSE;
   }
 
@@ -279,33 +286,60 @@ gst_mmal_video_sink_stop (GstBaseSink * sink)
 
   gst_mmal_video_sink_disable_renderer (self);
 
-
   if (self->renderer) {
-
-    if (self->pool) {
-      MMAL_PORT_T *input = NULL;
-
-      g_return_val_if_fail (self->renderer->input != NULL, FALSE);
-
-      input = self->renderer->input[0];
-      g_return_val_if_fail (input != NULL, FALSE);
-
-      mmal_port_pool_destroy (input, self->pool);
-    }
-
     mmal_component_release (self->renderer);
+    self->renderer = NULL;
   }
 
   bcm_host_deinit ();
 
+  if (self->vinfo_padded) {
+    gst_video_info_free (self->vinfo_padded);
+    self->vinfo_padded = NULL;
+  }
+
   return TRUE;
+}
+
+static void
+gst_mmal_video_sink_copy_frame_raw (guint8 * dest, GstVideoInfo * dinfo,
+    guint8 * src, GstVideoInfo * sinfo)
+{
+  guint i, n_components;
+
+  g_return_if_fail (dest != NULL && dinfo != NULL);
+  g_return_if_fail (src != NULL && sinfo != NULL);
+
+  g_return_if_fail (GST_VIDEO_INFO_SIZE (sinfo) <= GST_VIDEO_INFO_SIZE (dinfo));
+
+  n_components = GST_VIDEO_INFO_N_COMPONENTS (sinfo);
+
+  g_return_if_fail (n_components == GST_VIDEO_INFO_N_COMPONENTS (dinfo));
+
+  for (i = 0; i < n_components; ++i) {
+    gint sheight = GST_VIDEO_INFO_COMP_HEIGHT (sinfo, i);
+
+    gsize soffset = GST_VIDEO_INFO_COMP_OFFSET (sinfo, i),
+        doffset = GST_VIDEO_INFO_COMP_OFFSET (dinfo, i);
+
+    gint sstride = GST_VIDEO_INFO_COMP_STRIDE (sinfo, i),
+        dstride = GST_VIDEO_INFO_COMP_STRIDE (dinfo, i);
+
+    gint j;
+
+    g_return_if_fail (sheight <= GST_VIDEO_INFO_COMP_HEIGHT (dinfo, i));
+
+    for (j = 0; j < sheight; ++j) {
+      memcpy (dest + doffset + j * dstride,
+          src + soffset + j * sstride, sstride);
+    }
+  }
 }
 
 static GstFlowReturn
 gst_mmal_video_sink_show_frame (GstVideoSink * sink, GstBuffer * buffer)
 {
   MMAL_STATUS_T status;
-  MappedBuffer *mb = NULL;
   MMAL_BUFFER_HEADER_T *mmal_buf = NULL;
 
   GstMMALVideoSink *self;
@@ -322,28 +356,44 @@ gst_mmal_video_sink_show_frame (GstVideoSink * sink, GstBuffer * buffer)
   mmal_buf = mmal_queue_wait (self->pool->queue);
   g_return_val_if_fail (mmal_buf != NULL, GST_FLOW_ERROR);
 
-  /* Use MMAL buffer payload for mapped GStreamer buffer info */
-  mb = (MappedBuffer *) mmal_buf->data;
-  g_return_val_if_fail (mb != NULL, GST_FLOW_ERROR);
+  if (self->vinfo_padded) {
+    GstMapInfo info;
 
-  mb->buffer = gst_buffer_ref (buffer);
+    if (!gst_buffer_map (buffer, &info, GST_MAP_READ)) {
+      goto error_map_buffer;
+    }
 
-  if (!gst_buffer_map (mb->buffer, &mb->map_info, GST_MAP_READ)) {
-    gst_buffer_unref (mb->buffer);
-    mmal_buffer_header_release (mmal_buf);
-    GST_ERROR_OBJECT (self, "Failed to map frame buffer for reading");
-    return GST_FLOW_ERROR;
+    gst_mmal_video_sink_copy_frame_raw (mmal_buf->data, self->vinfo_padded,
+        info.data, &self->vinfo);
+
+    gst_buffer_unmap (buffer, &info);
+
+    mmal_buf->length = mmal_buf->alloc_size;
+  } else {
+    MappedBuffer *mb = NULL;
+
+    /* Use MMAL buffer payload for mapped GStreamer buffer info */
+    mb = (MappedBuffer *) mmal_buf->data;
+    g_return_val_if_fail (mb != NULL, GST_FLOW_ERROR);
+
+    if (!gst_buffer_map (buffer, &mb->map_info, GST_MAP_READ)) {
+      goto error_map_buffer;
+    }
+
+    mb->buffer = gst_buffer_ref (buffer);
+
+    /* Provide GStreamer buffer data without copying */
+    mmal_buf->data = mb->map_info.data;
+    mmal_buf->length = mb->map_info.size;
+    mmal_buf->alloc_size = mmal_buf->length;
+    mmal_buf->user_data = mb;
   }
 
-  /* Provide GStreamer buffer data without copying */
-  mmal_buf->data = mb->map_info.data;
-  mmal_buf->length = mb->map_info.size;
-  mmal_buf->alloc_size = mmal_buf->length;
   mmal_buf->pts = GST_BUFFER_PTS_IS_VALID (buffer) ?
       GST_TIME_AS_USECONDS (GST_BUFFER_PTS (buffer)) : MMAL_TIME_UNKNOWN;
   mmal_buf->dts = GST_BUFFER_DTS_IS_VALID (buffer) ?
       GST_TIME_AS_USECONDS (GST_BUFFER_DTS (buffer)) : MMAL_TIME_UNKNOWN;
-  mmal_buf->user_data = mb;
+  mmal_buf->flags = MMAL_BUFFER_HEADER_FLAG_FRAME;
 
   status = mmal_port_send_buffer (self->renderer->input[0], mmal_buf);
   if (status != MMAL_SUCCESS) {
@@ -353,6 +403,11 @@ gst_mmal_video_sink_show_frame (GstVideoSink * sink, GstBuffer * buffer)
   }
 
   return GST_FLOW_OK;
+
+error_map_buffer:
+  mmal_buffer_header_release (mmal_buf);
+  GST_ERROR_OBJECT (self, "Failed to map frame buffer for reading");
+  return GST_FLOW_ERROR;
 }
 
 static gboolean
@@ -362,7 +417,8 @@ gst_mmal_video_sink_configure_renderer (GstMMALVideoSink * self)
   MMAL_ES_FORMAT_T *format = NULL;
   MMAL_DISPLAYREGION_T display_region;
 
-  GstVideoInfo *info = NULL;
+  GstVideoInfo *vinfo = NULL;
+  gsize frame_size;
 
   MMAL_STATUS_T status;
 
@@ -378,18 +434,20 @@ gst_mmal_video_sink_configure_renderer (GstMMALVideoSink * self)
 
   gst_mmal_video_sink_disable_renderer (self);
 
-  info = &self->info;
+  vinfo = &self->vinfo;
 
   format->type = MMAL_ES_TYPE_VIDEO;
   format->encoding = MMAL_ENCODING_I420;
-  format->es->video.crop.width = GST_VIDEO_INFO_WIDTH (info);
-  format->es->video.crop.height = GST_VIDEO_INFO_HEIGHT (info);
-  format->es->video.width = GST_VIDEO_INFO_WIDTH (info);
-  format->es->video.height = GST_VIDEO_INFO_HEIGHT (info);
-  format->es->video.frame_rate.num = GST_VIDEO_INFO_FPS_N (info);
-  format->es->video.frame_rate.den = GST_VIDEO_INFO_FPS_D (info);
-  format->es->video.par.num = GST_VIDEO_INFO_PAR_N (info);
-  format->es->video.par.den = GST_VIDEO_INFO_PAR_D (info);
+  format->es->video.crop.width = GST_VIDEO_INFO_WIDTH (vinfo);
+  format->es->video.crop.height = GST_VIDEO_INFO_HEIGHT (vinfo);
+  format->es->video.width =
+      MMAL_I420_WIDTH_ALIGN (GST_VIDEO_INFO_WIDTH (vinfo));
+  format->es->video.height =
+      MMAL_I420_HEIGHT_ALIGN (GST_VIDEO_INFO_HEIGHT (vinfo));
+  format->es->video.frame_rate.num = GST_VIDEO_INFO_FPS_N (vinfo);
+  format->es->video.frame_rate.den = GST_VIDEO_INFO_FPS_D (vinfo);
+  format->es->video.par.num = GST_VIDEO_INFO_PAR_N (vinfo);
+  format->es->video.par.den = GST_VIDEO_INFO_PAR_D (vinfo);
   format->flags = MMAL_ES_FORMAT_FLAG_FRAMED;
 
   status = mmal_port_format_commit (input);
@@ -399,15 +457,43 @@ gst_mmal_video_sink_configure_renderer (GstMMALVideoSink * self)
     return FALSE;
   }
 
-  input->buffer_num = ARBITRARY_BUFFER_NUM;
-  /*
-   * We expect that given the format and its parameters are known, GStreamer
-   * will provide frame buffers of at least this size.
-   */
+  input->buffer_num = input->buffer_num_recommended;
   input->buffer_size = input->buffer_size_min;
 
-  GST_DEBUG_OBJECT (self, "buffer config: num=%u, size=%u",
+  frame_size = self->vinfo_padded ?
+      GST_VIDEO_INFO_SIZE (self->vinfo_padded) : GST_VIDEO_INFO_SIZE (vinfo);
+
+  if (frame_size != input->buffer_size) {
+    GST_ERROR_OBJECT (self,
+        "Frame buffer size is different than MMAL buffer size: %u != %u",
+        frame_size, input->buffer_size);
+    return FALSE;
+  }
+
+  GST_DEBUG_OBJECT (self, "MMAL buffer configuration: num=%u, size=%u",
       input->buffer_num, input->buffer_size);
+  GST_DEBUG_OBJECT (self, "GStreamer buffer configuration: size=%u, padding=%s",
+      GST_VIDEO_INFO_SIZE (vinfo), self->vinfo_padded ? "yes" : "no");
+
+  self->pool = mmal_port_pool_create (input,
+      input->buffer_num, self->vinfo_padded ?
+      /*
+       * Sub-optimal case where data needs to be copied from GStreamer into MMAL
+       * buffer payload and padded.
+       */
+      input->buffer_size :
+      /*
+       * Optimal case where GStreamer buffers are aligned with MMAL buffers.
+       * Here we use MMAL buffer payload for storing mapped GStreamer buffer
+       * information as we'll pass GStreamer buffer data directly to MMAL
+       * without copying it.
+       */
+      sizeof (MappedBuffer)
+      );
+  if (!self->pool) {
+    GST_ERROR_OBJECT (self, "Failer to create port buffer pool");
+    return FALSE;
+  }
 
   display_region.hdr.id = MMAL_PARAMETER_DISPLAYREGION;
   display_region.hdr.size = sizeof (MMAL_DISPLAYREGION_T);
@@ -421,16 +507,6 @@ gst_mmal_video_sink_configure_renderer (GstMMALVideoSink * self)
     return FALSE;
   }
 
-  self->renderer->control->userdata = (struct MMAL_PORT_USERDATA_T *) self;
-
-  status = mmal_port_enable (self->renderer->control, mmal_control_port_cb);
-  if (status != MMAL_SUCCESS) {
-    GST_ERROR_OBJECT (self,
-        "Failed to enable control port %s: %s (%u)",
-        self->renderer->control->name, mmal_status_to_string (status), status);
-    return FALSE;
-  }
-
   input->userdata = (struct MMAL_PORT_USERDATA_T *) self;
 
   status = mmal_port_enable (input, mmal_input_port_cb);
@@ -438,6 +514,16 @@ gst_mmal_video_sink_configure_renderer (GstMMALVideoSink * self)
     GST_ERROR_OBJECT (self,
         "Failed to enable input port %s: %s (%u)",
         input->name, mmal_status_to_string (status), status);
+    return FALSE;
+  }
+
+  self->renderer->control->userdata = (struct MMAL_PORT_USERDATA_T *) self;
+
+  status = mmal_port_enable (self->renderer->control, mmal_control_port_cb);
+  if (status != MMAL_SUCCESS) {
+    GST_ERROR_OBJECT (self,
+        "Failed to enable control port %s: %s (%u)",
+        self->renderer->control->name, mmal_status_to_string (status), status);
     return FALSE;
   }
 
@@ -469,6 +555,11 @@ gst_mmal_video_sink_disable_renderer (GstMMALVideoSink * self)
 
     if (self->renderer->input[0]->is_enabled) {
       mmal_port_disable (self->renderer->input[0]);
+    }
+
+    if (self->pool) {
+      mmal_port_pool_destroy (self->renderer->input[0], self->pool);
+      self->pool = NULL;
     }
 
     if (self->renderer->is_enabled) {

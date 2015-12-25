@@ -7,11 +7,17 @@ libgstmmal_la_SOURCES = \
 noinst_HEADERS = \
 	gstmmalvideosink.h
 
+# N.B. the `-fgnu89-inline` is there to suppress annoying "inline function
+# declared but never defined" warning from VC headers.
+#
 libgstmmal_la_CFLAGS = \
+	$(AM_CFLAGS) \
 	$(GST_PLUGINS_BASE_CFLAGS) \
 	$(GST_BASE_CFLAGS) \
 	$(GST_CFLAGS) \
-	$(GMODULE_NO_EXPORT_CFLAGS)
+	$(GMODULE_NO_EXPORT_CFLAGS) \
+	-fgnu89-inline \
+	-Wl,--no-as-needed -Wl,-lmmal -Wl,--as-needed
 
 libgstmmal_la_LIBADD = \
 	-lbcm_host \

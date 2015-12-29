@@ -33,11 +33,20 @@
 #include <interface/mmal/util/mmal_util.h>
 #include <interface/mmal/util/mmal_default_components.h>
 
-#define ARBITRARY_BUFFER_NUM 5
-
 #define MMAL_I420_STRIDE_ALIGN 32
 #define MMAL_I420_WIDTH_ALIGN GST_ROUND_UP_32
 #define MMAL_I420_HEIGHT_ALIGN GST_ROUND_UP_16
+
+#define MMAL_BUFFER_NUM 3
+
+#define MAX_VIDEO_WIDTH 1920
+#define MAX_VIDEO_HEIGHT 1080
+
+#define MAX_I420_RES \
+    (MMAL_I420_WIDTH_ALIGN (MAX_VIDEO_WIDTH) * \
+     MMAL_I420_HEIGHT_ALIGN (MAX_VIDEO_HEIGHT))
+
+#define MAX_I420_BUFFER_SIZE ((3 * MAX_I420_RES) / 2)
 
 #define GST_MMAL_VIDEO_SINK(obj) \
   (G_TYPE_CHECK_INSTANCE_CAST((obj), GST_TYPE_MMALVIDEOSINK, GstMMALVideoSink))
@@ -76,10 +85,15 @@ GST_DEBUG_CATEGORY (mmalvideosink_debug);
 #define gst_mmalvideosink_parent_class parent_class
 G_DEFINE_TYPE (GstMMALVideoSink, gst_mmal_video_sink, GST_TYPE_VIDEO_SINK);
 
+static gboolean mmal_port_supports_format_change (MMAL_PORT_T * port);
+
 static void mmal_control_port_cb (MMAL_PORT_T * port,
     MMAL_BUFFER_HEADER_T * buffer);
 static void mmal_input_port_cb (MMAL_PORT_T * port,
     MMAL_BUFFER_HEADER_T * buffer);
+
+static void gst_mmal_video_sink_set_format (MMAL_ES_FORMAT_T * format,
+    GstVideoInfo * vinfo);
 
 static gboolean gst_mmal_video_sink_set_caps (GstBaseSink * sink,
     GstCaps * caps);
@@ -89,9 +103,11 @@ static gboolean gst_mmal_video_sink_stop (GstBaseSink * sink);
 static GstFlowReturn gst_mmal_video_sink_show_frame (GstVideoSink * videosink,
     GstBuffer * buffer);
 
+static gboolean gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self);
 static gboolean gst_mmal_video_sink_configure_renderer (GstMMALVideoSink *
     self);
 static void gst_mmal_video_sink_disable_renderer (GstMMALVideoSink * self);
+static gboolean gst_mmal_video_sink_enable_renderer (GstMMALVideoSink * self);
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK,
@@ -122,6 +138,12 @@ gst_mmal_video_sink_class_init (GstMMALVideoSinkClass * klass)
 
   videosink_class->show_frame =
       GST_DEBUG_FUNCPTR (gst_mmal_video_sink_show_frame);
+}
+
+static gboolean
+mmal_port_supports_format_change (MMAL_PORT_T * port)
+{
+  return port->capabilities & MMAL_PORT_CAPABILITY_SUPPORTS_EVENT_FORMAT_CHANGE;
 }
 
 static void
@@ -161,7 +183,7 @@ mmal_input_port_cb (MMAL_PORT_T * port, MMAL_BUFFER_HEADER_T * buffer)
   GST_TRACE_OBJECT (self, "input port callback");
 
   if (buffer->cmd != 0) {
-    GST_DEBUG_OBJECT (self, "Input port event: %u", buffer->cmd);
+    GST_DEBUG_OBJECT (self, "input port event: %u", buffer->cmd);
   } else {
     MappedBuffer *mb = (MappedBuffer *) buffer->user_data;
 
@@ -173,7 +195,8 @@ mmal_input_port_cb (MMAL_PORT_T * port, MMAL_BUFFER_HEADER_T * buffer)
        * Restore original MMAL buffer payload we used for storing buffer info
        */
       buffer->data = (uint8_t *) mb;
-      buffer->length = buffer->alloc_size = sizeof (*mb);
+
+      buffer->user_data = NULL;
     }
   }
 
@@ -190,6 +213,27 @@ gst_mmal_video_sink_init (GstMMALVideoSink * self)
 
   self->renderer = NULL;
   self->pool = NULL;
+}
+
+static void
+gst_mmal_video_sink_set_format (MMAL_ES_FORMAT_T * format, GstVideoInfo * vinfo)
+{
+  g_return_if_fail (format != NULL);
+  g_return_if_fail (vinfo != NULL);
+
+  format->type = MMAL_ES_TYPE_VIDEO;
+  format->encoding = MMAL_ENCODING_I420;
+  format->es->video.crop.width = GST_VIDEO_INFO_WIDTH (vinfo);
+  format->es->video.crop.height = GST_VIDEO_INFO_HEIGHT (vinfo);
+  format->es->video.width =
+      MMAL_I420_WIDTH_ALIGN (GST_VIDEO_INFO_WIDTH (vinfo));
+  format->es->video.height =
+      MMAL_I420_HEIGHT_ALIGN (GST_VIDEO_INFO_HEIGHT (vinfo));
+  format->es->video.frame_rate.num = GST_VIDEO_INFO_FPS_N (vinfo);
+  format->es->video.frame_rate.den = GST_VIDEO_INFO_FPS_D (vinfo);
+  format->es->video.par.num = GST_VIDEO_INFO_PAR_N (vinfo);
+  format->es->video.par.den = GST_VIDEO_INFO_PAR_D (vinfo);
+  format->flags = MMAL_ES_FORMAT_FLAG_FRAMED;
 }
 
 static gboolean
@@ -246,6 +290,8 @@ gst_mmal_video_sink_set_caps (GstBaseSink * sink, GstCaps * caps)
 static gboolean
 gst_mmal_video_sink_start (GstBaseSink * sink)
 {
+  MMAL_PORT_T *input = NULL;
+  MMAL_DISPLAYREGION_T display_region;
   MMAL_STATUS_T status;
 
   GstMMALVideoSink *self = NULL;
@@ -271,6 +317,31 @@ gst_mmal_video_sink_start (GstBaseSink * sink)
     return FALSE;
   }
 
+  g_return_val_if_fail (self->renderer != NULL, FALSE);
+  g_return_val_if_fail (self->renderer->input != NULL, FALSE);
+
+  input = self->renderer->input[0];
+  g_return_val_if_fail (input != NULL, FALSE);
+
+  display_region.hdr.id = MMAL_PARAMETER_DISPLAYREGION;
+  display_region.hdr.size = sizeof (MMAL_DISPLAYREGION_T);
+  display_region.fullscreen = MMAL_TRUE;
+  display_region.mode = MMAL_DISPLAY_MODE_FILL;
+  display_region.set = MMAL_DISPLAY_SET_FULLSCREEN | MMAL_DISPLAY_SET_MODE;
+  status = mmal_port_parameter_set (input, &display_region.hdr);
+  if (status != MMAL_SUCCESS) {
+    GST_ERROR_OBJECT (self, "Failed to set display region: %s (%u)",
+        mmal_status_to_string (status), status);
+    return FALSE;
+  }
+
+  self->pool = mmal_port_pool_create (input, MMAL_BUFFER_NUM,
+      MAX_I420_BUFFER_SIZE);
+  if (!self->pool) {
+    GST_ERROR_OBJECT (self, "Failer to create port buffer pool");
+    return FALSE;
+  }
+
   return TRUE;
 }
 
@@ -285,6 +356,11 @@ gst_mmal_video_sink_stop (GstBaseSink * sink)
   GST_DEBUG_OBJECT (self, "stop");
 
   gst_mmal_video_sink_disable_renderer (self);
+
+  if (self->pool) {
+    mmal_port_pool_destroy (self->renderer->input[0], self->pool);
+    self->pool = NULL;
+  }
 
   if (self->renderer) {
     mmal_component_release (self->renderer);
@@ -368,7 +444,8 @@ gst_mmal_video_sink_show_frame (GstVideoSink * sink, GstBuffer * buffer)
 
     gst_buffer_unmap (buffer, &info);
 
-    mmal_buf->length = mmal_buf->alloc_size;
+    mmal_buf->length = GST_VIDEO_INFO_SIZE (self->vinfo_padded);
+    mmal_buf->user_data = NULL;
   } else {
     MappedBuffer *mb = NULL;
 
@@ -385,7 +462,6 @@ gst_mmal_video_sink_show_frame (GstVideoSink * sink, GstBuffer * buffer)
     /* Provide GStreamer buffer data without copying */
     mmal_buf->data = mb->map_info.data;
     mmal_buf->length = mb->map_info.size;
-    mmal_buf->alloc_size = mmal_buf->length;
     mmal_buf->user_data = mb;
   }
 
@@ -411,61 +487,31 @@ error_map_buffer:
 }
 
 static gboolean
-gst_mmal_video_sink_configure_renderer (GstMMALVideoSink * self)
+gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self)
 {
-  MMAL_PORT_T *input = NULL;
-  MMAL_ES_FORMAT_T *format = NULL;
-  MMAL_DISPLAYREGION_T display_region;
-
   GstVideoInfo *vinfo = NULL;
+  MMAL_PORT_T *input = NULL;
   gsize frame_size;
 
-  MMAL_STATUS_T status;
-
   g_return_val_if_fail (self != NULL, FALSE);
+
+  vinfo = &self->vinfo;
+
   g_return_val_if_fail (self->renderer != NULL, FALSE);
   g_return_val_if_fail (self->renderer->input != NULL, FALSE);
 
   input = self->renderer->input[0];
   g_return_val_if_fail (input != NULL, FALSE);
 
-  format = input->format;
-  g_return_val_if_fail (format != NULL, FALSE);
-
-  gst_mmal_video_sink_disable_renderer (self);
-
-  vinfo = &self->vinfo;
-
-  format->type = MMAL_ES_TYPE_VIDEO;
-  format->encoding = MMAL_ENCODING_I420;
-  format->es->video.crop.width = GST_VIDEO_INFO_WIDTH (vinfo);
-  format->es->video.crop.height = GST_VIDEO_INFO_HEIGHT (vinfo);
-  format->es->video.width =
-      MMAL_I420_WIDTH_ALIGN (GST_VIDEO_INFO_WIDTH (vinfo));
-  format->es->video.height =
-      MMAL_I420_HEIGHT_ALIGN (GST_VIDEO_INFO_HEIGHT (vinfo));
-  format->es->video.frame_rate.num = GST_VIDEO_INFO_FPS_N (vinfo);
-  format->es->video.frame_rate.den = GST_VIDEO_INFO_FPS_D (vinfo);
-  format->es->video.par.num = GST_VIDEO_INFO_PAR_N (vinfo);
-  format->es->video.par.den = GST_VIDEO_INFO_PAR_D (vinfo);
-  format->flags = MMAL_ES_FORMAT_FLAG_FRAMED;
-
-  status = mmal_port_format_commit (input);
-  if (status != MMAL_SUCCESS) {
-    GST_ERROR_OBJECT (self, "Failed to commit input format: %s (%u)",
-        mmal_status_to_string (status), status);
-    return FALSE;
-  }
-
-  input->buffer_num = input->buffer_num_recommended;
-  input->buffer_size = input->buffer_size_min;
+  input->buffer_num = MMAL_BUFFER_NUM;
+  input->buffer_size = MAX_I420_BUFFER_SIZE;
 
   frame_size = self->vinfo_padded ?
       GST_VIDEO_INFO_SIZE (self->vinfo_padded) : GST_VIDEO_INFO_SIZE (vinfo);
 
-  if (frame_size != input->buffer_size) {
+  if (frame_size > input->buffer_size) {
     GST_ERROR_OBJECT (self,
-        "Frame buffer size is different than MMAL buffer size: %u != %u",
+        "Frame buffer size is greater than MMAL buffer size: %u != %u",
         frame_size, input->buffer_size);
     return FALSE;
   }
@@ -475,67 +521,37 @@ gst_mmal_video_sink_configure_renderer (GstMMALVideoSink * self)
   GST_DEBUG_OBJECT (self, "GStreamer buffer configuration: size=%u, padding=%s",
       GST_VIDEO_INFO_SIZE (vinfo), self->vinfo_padded ? "yes" : "no");
 
-  self->pool = mmal_port_pool_create (input,
-      input->buffer_num, self->vinfo_padded ?
-      /*
-       * Sub-optimal case where data needs to be copied from GStreamer into MMAL
-       * buffer payload and padded.
-       */
-      input->buffer_size :
-      /*
-       * Optimal case where GStreamer buffers are aligned with MMAL buffers.
-       * Here we use MMAL buffer payload for storing mapped GStreamer buffer
-       * information as we'll pass GStreamer buffer data directly to MMAL
-       * without copying it.
-       */
-      sizeof (MappedBuffer)
-      );
-  if (!self->pool) {
-    GST_ERROR_OBJECT (self, "Failer to create port buffer pool");
-    return FALSE;
-  }
-
-  display_region.hdr.id = MMAL_PARAMETER_DISPLAYREGION;
-  display_region.hdr.size = sizeof (MMAL_DISPLAYREGION_T);
-  display_region.fullscreen = MMAL_TRUE;
-  display_region.mode = MMAL_DISPLAY_MODE_FILL;
-  display_region.set = MMAL_DISPLAY_SET_FULLSCREEN | MMAL_DISPLAY_SET_MODE;
-  status = mmal_port_parameter_set (input, &display_region.hdr);
-  if (status != MMAL_SUCCESS) {
-    GST_ERROR_OBJECT (self, "Failed to set display region: %s (%u)",
-        mmal_status_to_string (status), status);
-    return FALSE;
-  }
-
-  input->userdata = (struct MMAL_PORT_USERDATA_T *) self;
-
-  status = mmal_port_enable (input, mmal_input_port_cb);
-  if (status != MMAL_SUCCESS) {
-    GST_ERROR_OBJECT (self,
-        "Failed to enable input port %s: %s (%u)",
-        input->name, mmal_status_to_string (status), status);
-    return FALSE;
-  }
-
-  self->renderer->control->userdata = (struct MMAL_PORT_USERDATA_T *) self;
-
-  status = mmal_port_enable (self->renderer->control, mmal_control_port_cb);
-  if (status != MMAL_SUCCESS) {
-    GST_ERROR_OBJECT (self,
-        "Failed to enable control port %s: %s (%u)",
-        self->renderer->control->name, mmal_status_to_string (status), status);
-    return FALSE;
-  }
-
-  status = mmal_component_enable (self->renderer);
-  if (status != MMAL_SUCCESS) {
-    GST_ERROR_OBJECT (self,
-        "Failed to enable renderer component: %s (%u)",
-        mmal_status_to_string (status), status);
-    return FALSE;
-  }
-
   return TRUE;
+}
+
+static gboolean
+gst_mmal_video_sink_configure_renderer (GstMMALVideoSink * self)
+{
+  MMAL_PORT_T *input = NULL;
+  MMAL_STATUS_T status;
+
+  g_return_val_if_fail (self != NULL, FALSE);
+  g_return_val_if_fail (self->renderer != NULL, FALSE);
+  g_return_val_if_fail (self->renderer->input != NULL, FALSE);
+
+  input = self->renderer->input[0];
+  g_return_val_if_fail (input != NULL, FALSE);
+
+  if (!mmal_port_supports_format_change (input)) {
+    gst_mmal_video_sink_disable_renderer (self);
+  }
+
+  gst_mmal_video_sink_set_format (input->format, &self->vinfo);
+
+  status = mmal_port_format_commit (input);
+  if (status != MMAL_SUCCESS) {
+    GST_ERROR_OBJECT (self, "Failed to commit input format: %s (%u)",
+        mmal_status_to_string (status), status);
+    return FALSE;
+  }
+
+  return gst_mmal_video_sink_configure_pool (self) &&
+      gst_mmal_video_sink_enable_renderer (self);
 }
 
 static void
@@ -557,13 +573,63 @@ gst_mmal_video_sink_disable_renderer (GstMMALVideoSink * self)
       mmal_port_disable (self->renderer->input[0]);
     }
 
-    if (self->pool) {
-      mmal_port_pool_destroy (self->renderer->input[0], self->pool);
-      self->pool = NULL;
-    }
-
     if (self->renderer->is_enabled) {
       mmal_component_disable (self->renderer);
     }
   }
+}
+
+static gboolean
+gst_mmal_video_sink_enable_renderer (GstMMALVideoSink * self)
+{
+  MMAL_PORT_T *input = NULL;
+  MMAL_STATUS_T status;
+
+  g_return_val_if_fail (self != NULL, FALSE);
+
+  if (self->renderer) {
+    g_return_val_if_fail (self->renderer->control != NULL, FALSE);
+
+    if (!self->renderer->control->is_enabled) {
+      self->renderer->control->userdata = (struct MMAL_PORT_USERDATA_T *) self;
+
+      status = mmal_port_enable (self->renderer->control, mmal_control_port_cb);
+      if (status != MMAL_SUCCESS) {
+        GST_ERROR_OBJECT (self,
+            "Failed to enable control port %s: %s (%u)",
+            self->renderer->control->name, mmal_status_to_string (status),
+            status);
+        return FALSE;
+      }
+    }
+
+    g_return_val_if_fail (self->renderer->input != NULL, FALSE);
+
+    input = self->renderer->input[0];
+    g_return_val_if_fail (input != NULL, FALSE);
+
+    if (!input->is_enabled) {
+      input->userdata = (struct MMAL_PORT_USERDATA_T *) self;
+
+      status = mmal_port_enable (input, mmal_input_port_cb);
+      if (status != MMAL_SUCCESS) {
+        GST_ERROR_OBJECT (self,
+            "Failed to enable input port %s: %s (%u)",
+            input->name, mmal_status_to_string (status), status);
+        return FALSE;
+      }
+    }
+
+    if (!self->renderer->is_enabled) {
+      status = mmal_component_enable (self->renderer);
+      if (status != MMAL_SUCCESS) {
+        GST_ERROR_OBJECT (self,
+            "Failed to enable renderer component: %s (%u)",
+            mmal_status_to_string (status), status);
+        return FALSE;
+      }
+    }
+  }
+
+  return TRUE;
 }

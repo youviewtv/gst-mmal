@@ -68,6 +68,11 @@ struct _GstMMALVideoDec
    * the first buffer */
   gboolean started;
 
+  /* If the caps have just been changed. On the first output frame after a caps
+     change we may need to set the src caps again.
+   */
+  gboolean caps_changed;
+
   GstClockTime last_upstream_ts;
 };
 

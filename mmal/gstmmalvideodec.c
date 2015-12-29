@@ -185,6 +185,7 @@ gst_mmal_video_dec_init (GstMMALVideoDec * self)
   self->output_buffer_pool = NULL;
   self->started = FALSE;
   self->last_upstream_ts = 0;
+  self->caps_changed = FALSE;
 }
 
 static gboolean
@@ -575,6 +576,41 @@ gst_mmal_video_dec_update_src_caps (GstMMALVideoDec * self)
   GstVideoFormat format =
       gst_mmal_video_get_format_from_mmal (output_format->encoding);
 
+  /* This requires explanation. The reason we need to twiddle output port
+     enablement and commit the output format here, (instead of in set_format()),
+     is because:
+
+     a) upstream elements don't tell us the right framerate. 200/1? really?
+     b) the decoder can work-out framerate from headers in stream (e.g.H264 SPS)
+     c) we don't seem to get any "port settings changed" event on the output
+     port, as we might expect.
+     d) the decoder will need to see at least the first frame before it can work
+     out framerate.
+     e) the output port format doesn't seem to be updated unless we do this
+     little dance of disable, commit format, and re-enable the output port.
+
+     Perhaps there is a simpler way to achieve the same result, but I don't know
+     what that is.
+   */
+  if (mmal_port_disable (self->dec->output[0]) != MMAL_SUCCESS) {
+    GST_ERROR_OBJECT (self, "Failed to disable output port.");
+    return FALSE;
+  }
+
+  if (mmal_port_format_commit (self->dec->output[0]) != MMAL_SUCCESS) {
+    GST_ERROR_OBJECT (self, "Failed to commit output port format.");
+    return FALSE;
+  }
+
+  if (mmal_port_enable (self->dec->output[0],
+          &gst_mmal_video_dec_queue_decoded_frame) != MMAL_SUCCESS) {
+    GST_ERROR_OBJECT (self, "Failed to re-enable output port.");
+    return FALSE;
+  }
+
+  /* Make sure the ouput port has buffers, just in case. */
+  gst_mmal_video_dec_populate_output_port (self);
+
   if (format == GST_VIDEO_FORMAT_UNKNOWN) {
 
     GST_ERROR_OBJECT (self, "Unsupported color format: %lu",
@@ -589,11 +625,18 @@ gst_mmal_video_dec_update_src_caps (GstMMALVideoDec * self)
       format, output_format->es->video.crop.width,
       output_format->es->video.crop.height, self->input_state);
 
+  /* Take framerate from output port for src caps. */
+  GST_VIDEO_INFO_FPS_N (&state->info) = output_format->es->video.frame_rate.num;
+  GST_VIDEO_INFO_FPS_D (&state->info) = output_format->es->video.frame_rate.den;
+
   if (!gst_video_decoder_negotiate (GST_VIDEO_DECODER (self))) {
     gst_video_codec_state_unref (state);
     GST_ERROR_OBJECT (self, "Failed to negotiate caps with downstream.");
     goto error;
   }
+
+  /* Don't want to come back into this function until next set_format() */
+  self->caps_changed = FALSE;
 
   return TRUE;
 
@@ -804,8 +847,12 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
     input_format->es->video.width = GST_ROUND_UP_32 (info->width);
     input_format->es->video.height = GST_ROUND_UP_16 (info->height);
 
-    input_format->es->video.frame_rate.num = info->fps_n;
-    input_format->es->video.frame_rate.den = info->fps_d;
+    /* Don't provide any hint on framerate. Upstream sometimes gets it wrong.
+       Let the decoder figure it out.
+     */
+    input_format->es->video.frame_rate.num = 0;
+    input_format->es->video.frame_rate.den = 0;
+
     input_format->es->video.par.num = info->par_n;
     input_format->es->video.par.den = info->par_d;
     input_format->type = MMAL_ES_TYPE_VIDEO;
@@ -882,18 +929,13 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
     }
 
 
-    /*
-       Tell downstream about the change. N.B. according to the documentation for
-       gst_video_decoder_set_output_state():
-
-       "The new output state will only take effect (set on pads and buffers)
-       starting from the next call to gst_video_decoder_finish_frame()."
+    /* This will cause update_src_caps() to be called by handle_decoded_frames()
+       next time we have an output frame from the decoder.  We defer the call
+       until next output frame as the decoder can then figure-out things like
+       framerate and interlaced vs progressive, which we want to set in src
+       caps.
      */
-
-    if (!gst_mmal_video_dec_update_src_caps (self)) {
-      GST_ERROR_OBJECT (self, "Failed to update src caps!");
-      return FALSE;
-    }
+    self->caps_changed = TRUE;
 
 
     /*
@@ -1215,6 +1257,8 @@ gst_mmal_video_dec_handle_decoded_frames (GstMMALVideoDec * self,
      */
     if (buffer->cmd) {
 
+      GST_DEBUG_OBJECT (self, "Received command.");
+
       switch (buffer->cmd) {
 
         case MMAL_EVENT_EOS:
@@ -1251,6 +1295,22 @@ gst_mmal_video_dec_handle_decoded_frames (GstMMALVideoDec * self,
 
       /* See EOS comment, above */
       if (buffer->length) {
+
+        /* Did we have a caps change via set_format() just previously?
+           Now that the decoder has seen a frame with the "new" format, it
+           should have some idea about the framerate and whether interlaced.
+           It doesn't know these things before seeing frames, and we can't
+           really rely on upstream elements to get this right, as we're seeing
+           framerate of "200/1" on input caps, and "progressive" when actually
+           interlaced.
+         */
+        if (self->caps_changed) {
+
+          if (!gst_mmal_video_dec_update_src_caps (self)) {
+            GST_ERROR_OBJECT (self, "Failed to update src caps!");
+            flow_ret = GST_FLOW_ERROR;
+          }
+        }
 
         frame = gst_mmal_video_dec_find_nearest_frame (buffer,
             gst_video_decoder_get_frames (GST_VIDEO_DECODER (self)));
@@ -1341,6 +1401,7 @@ gst_mmal_video_dec_handle_decoded_frames (GstMMALVideoDec * self,
       buffer = mmal_queue_get (self->decoded_frames_queue);
     }
   }
+  /* end-while (more frames and everything OK) */
 
   return flow_ret;
 }

@@ -47,6 +47,26 @@ GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS (gst_mmal_video_dec_src_caps_str));
 
+
+struct MappedBuffer_;
+
+struct MappedBuffer_
+{
+  GstBuffer *buffer;
+  GstMapInfo map_info;
+
+  /* N.B. The linked-list structure serves the same purpose as a refcount.
+     I don't want to map & unmap the buffer n times, and due to MMAL restriction
+     we may have to pass the same GstBuffer into multiple MMAL buffer headers.
+   */
+  struct MappedBuffer_ *next;
+  struct MappedBuffer_ *previous;
+
+};
+
+typedef struct MappedBuffer_ MappedBuffer;
+
+
 /* prototypes */
 
 
@@ -165,7 +185,6 @@ gst_mmal_video_dec_init (GstMMALVideoDec * self)
   self->output_buffer_pool = NULL;
   self->started = FALSE;
   self->last_upstream_ts = 0;
-
 }
 
 static gboolean
@@ -330,6 +349,49 @@ static void
 gst_mmal_video_dec_return_input_buffer_to_pool (MMAL_PORT_T * port,
     MMAL_BUFFER_HEADER_T * buffer)
 {
+  MappedBuffer *mb = NULL;
+
+  /* We're using the GstBuffer directly, rather than copying into an MMAL
+     allocated buffer.  So we need to unmap and unref the GstBuffer once the
+     decoder is done with it.
+
+     N.B. We `user_data` will be NULL in case buffer had no GstBuffer attached,
+     (i.e. when EOS buffer sent from drain()).
+   */
+  if (!buffer->cmd && buffer->user_data) {
+
+    mb = (MappedBuffer *) buffer->user_data;
+
+    g_return_if_fail (mb != NULL);
+
+    /* Was this the last MMAL buffer header pointing at our mapped GST buffer?
+       If so, we can unmap it.
+
+       Incidentally, we can have several MMAL headers pointing to different
+       offsets in the same GST buffer mapping since we must tell MMAL upfront
+       how big the input buffers are, and our GST buffer might exceed that size.
+     */
+    if (mb->next == NULL && mb->previous == NULL) {
+
+      gst_buffer_unmap (mb->buffer, &mb->map_info);
+      gst_buffer_unref (mb->buffer);
+
+    } else {
+
+      /* Not the last reference. Unmap later. */
+      if (mb->previous) {
+        mb->previous->next = mb->next;
+      }
+
+      if (mb->next) {
+        mb->next->previous = mb->previous;
+      }
+    }
+
+    /* Restore original MMAL buffer payload we used for storing buffer info */
+    buffer->data = (uint8_t *) mb;
+    buffer->length = buffer->alloc_size = sizeof (*mb);
+  }
 
   /* This drops the refcount of the buffer header.  It will be returned to it's
      pool when the refcount reaches zero.
@@ -461,6 +523,7 @@ gst_mmal_print_port_format (MMAL_PORT_T * port, GstElement * element)
       );
 }
 
+
 /**
  * This is just simple debug function to print out port information.
  */
@@ -491,6 +554,7 @@ gst_mmal_print_port_info (MMAL_PORT_T * port, GstElement * element)
       port->buffer_alignment_min,
       port->buffer_num_recommended,
       port->buffer_size_recommended, port->buffer_num, port->buffer_size);
+
 
   gst_mmal_print_port_format (port, element);
 }
@@ -537,6 +601,7 @@ error:
   /* N.B. would release stream lock here, if acquired. */
   return FALSE;
 }
+
 
 /**
  * Drain the decoder.
@@ -588,6 +653,11 @@ gst_mmal_video_dec_drain (GstMMALVideoDec * self)
     buffer->cmd = 0;
 
     buffer->flags |= MMAL_BUFFER_HEADER_FLAG_EOS;
+
+    /* Avoid trying to unref GstBuffer when releasing MMAL input buffer.
+       See: gst_mmal_video_dec_return_input_buffer_to_pool().
+     */
+    buffer->user_data = NULL;
 
     buffer->pts = gst_util_uint64_scale (self->last_upstream_ts,
         MMAL_TICKS_PER_SECOND, GST_SECOND);
@@ -791,22 +861,17 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
        and instead allocate only 2 x 1MB buffers to "reduce latency".  Perhaps
        that is worth some experimentation.
 
-       More ideally, we would allocate only the buffer headers here, not the
-       actual buffers, and instead setup each buffer header to point to the
-       incoming GstBuffer memories, thus eliding a copy of the input.  This
-       would have to be done in handle_frame().
+       In order to avoid copying the input GstBuffers, we ask MMAL to allocate
+       payload buffers just big enough to hold some housekeeping data relating
+       to the mapped GstBuffer memories.  We don't bother to reallocate the
+       input buffer pool on format change, since the payload size and number of
+       buffer headers will never change in practice.
      */
 
     if (self->input_buffer_pool == NULL) {
 
       self->input_buffer_pool = mmal_pool_create (input_port->buffer_num,
-          input_port->buffer_size);
-
-    } else if (mmal_pool_resize (self->input_buffer_pool,
-            input_port->buffer_num, input_port->buffer_size) != MMAL_SUCCESS) {
-
-      GST_ERROR_OBJECT (self, "Failed to resize input buffer pool!");
-      return FALSE;
+          sizeof (MappedBuffer));
     }
 
     if (mmal_port_enable (input_port,
@@ -836,17 +901,6 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
        in-band events.  It seems we don't get those most of the time though, so
        I'm also dealing with the output port here.
      */
-    if (self->input_buffer_pool == NULL) {
-
-      self->input_buffer_pool = mmal_pool_create (input_port->buffer_num,
-          input_port->buffer_size);
-
-    } else if (mmal_pool_resize (self->input_buffer_pool,
-            input_port->buffer_num, input_port->buffer_size) != MMAL_SUCCESS) {
-
-      GST_ERROR_OBJECT (self, "Failed to resize input buffer pool!");
-      return FALSE;
-    }
 
     output_port->buffer_num = output_port->buffer_num_recommended +
         GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFERS;
@@ -872,6 +926,7 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
       self->decoded_frames_queue = mmal_queue_create ();
       output_port->userdata = (void *) self->decoded_frames_queue;
     }
+
 
     if (mmal_port_enable (output_port,
             &gst_mmal_video_dec_queue_decoded_frame) != MMAL_SUCCESS) {
@@ -993,7 +1048,10 @@ gst_mmal_video_dec_find_nearest_frame (MMAL_BUFFER_HEADER_T * buf,
 
 
 /**
- * This is lifted (and adapted) from gst-omx (gstomxvideodec.c).
+ * Copy MMAL ouput buffer to GstBuffer
+ *
+ * This is lifted (and adapted) from gst-omx (gstomxvideodec.c), with some
+ * simplification, since we are only supporting I420.
  *
  * It is used by gst_mmal_video_dec_handle_decoded_frames(), when not using
  * opaque output buffers and doing dumb copy from decoder output buffer to
@@ -1026,7 +1084,9 @@ gst_mmal_video_dec_fill_buffer (GstMMALVideoDec * self,
     goto done;
   }
 
-  /* Same strides and everything */
+  /* This is the simple case.  The strides and offset of the MMAL & GST buffers
+     match, so a single memcpy will suffice.
+   */
   if (gst_buffer_get_size (outbuf) == inbuf->length) {
 
     GstMapInfo map = GST_MAP_INFO_INIT;
@@ -1044,7 +1104,13 @@ gst_mmal_video_dec_fill_buffer (GstMMALVideoDec * self,
     goto done;
   }
 
-  /* Different strides */
+  GST_DEBUG_OBJECT (self, "\n"
+      "MMAL Buffer size: %d\nGstBuffer size:   %d\n", inbuf->alloc_size,
+      gst_buffer_get_size (outbuf));
+
+  /* More complicated case. Different buffer sizes.  Strides and offsets don't
+     match.
+   */
   if (gst_video_frame_map (&frame, vinfo, outbuf, GST_MAP_WRITE)) {
 
     const guint nstride = output_format->es->video.width;
@@ -1058,54 +1124,25 @@ gst_mmal_video_dec_fill_buffer (GstMMALVideoDec * self,
     const guint8 *src;
     guint p;
 
-    GST_DEBUG_OBJECT (self, "Different strides.");
+    GST_DEBUG_OBJECT (self, "Different strides.\n"
+        "MMAL buffer size: %d\n"
+        "GST buffer size: %d\n", inbuf->length, gst_buffer_get_size (outbuf));
 
-    switch (GST_VIDEO_INFO_FORMAT (vinfo)) {
-      case GST_VIDEO_FORMAT_ABGR:
-      case GST_VIDEO_FORMAT_ARGB:
-        dst_width[0] = GST_VIDEO_INFO_WIDTH (vinfo) * 4;
-        break;
-      case GST_VIDEO_FORMAT_RGB16:
-      case GST_VIDEO_FORMAT_BGR16:
-      case GST_VIDEO_FORMAT_YUY2:
-      case GST_VIDEO_FORMAT_UYVY:
-      case GST_VIDEO_FORMAT_YVYU:
-        dst_width[0] = GST_VIDEO_INFO_WIDTH (vinfo) * 2;
-        break;
-      case GST_VIDEO_FORMAT_GRAY8:
-        dst_width[0] = GST_VIDEO_INFO_WIDTH (vinfo);
-        break;
-      case GST_VIDEO_FORMAT_I420:
-        dst_width[0] = GST_VIDEO_INFO_WIDTH (vinfo);
-        src_stride[1] = nstride / 2;
-        src_size[1] = (src_stride[1] * nslice) / 2;
-        dst_width[1] = GST_VIDEO_INFO_WIDTH (vinfo) / 2;
-        dst_height[1] = GST_VIDEO_INFO_HEIGHT (vinfo) / 2;
-        src_stride[2] = nstride / 2;
-        src_size[2] = (src_stride[1] * nslice) / 2;
-        dst_width[2] = GST_VIDEO_INFO_WIDTH (vinfo) / 2;
-        dst_height[2] = GST_VIDEO_INFO_HEIGHT (vinfo) / 2;
-        break;
-      case GST_VIDEO_FORMAT_NV12:
-        dst_width[0] = GST_VIDEO_INFO_WIDTH (vinfo);
-        src_stride[1] = nstride;
-        src_size[1] = src_stride[1] * nslice / 2;
-        dst_width[1] = GST_VIDEO_INFO_WIDTH (vinfo);
-        dst_height[1] = GST_VIDEO_INFO_HEIGHT (vinfo) / 2;
-        break;
-      case GST_VIDEO_FORMAT_NV16:
-        dst_width[0] = GST_VIDEO_INFO_WIDTH (vinfo);
-        src_stride[1] = nstride;
-        src_size[1] = src_stride[1] * nslice;
-        dst_width[1] = GST_VIDEO_INFO_WIDTH (vinfo);
-        dst_height[1] = GST_VIDEO_INFO_HEIGHT (vinfo);
-        break;
-      default:
-        g_assert_not_reached ();
-        break;
-    }
+
+    /* These are for I420 */
+    dst_width[0] = GST_VIDEO_INFO_WIDTH (vinfo);
+    src_stride[1] = nstride / 2;
+    src_size[1] = (src_stride[1] * nslice) / 2;
+    dst_width[1] = GST_VIDEO_INFO_WIDTH (vinfo) / 2;
+    dst_height[1] = GST_VIDEO_INFO_HEIGHT (vinfo) / 2;
+    src_stride[2] = nstride / 2;
+    src_size[2] = (src_stride[1] * nslice) / 2;
+    dst_width[2] = GST_VIDEO_INFO_WIDTH (vinfo) / 2;
+    dst_height[2] = GST_VIDEO_INFO_HEIGHT (vinfo) / 2;
 
     src = inbuf->data + inbuf->offset;
+
+    /* Plane-by-plane */
     for (p = 0; p < GST_VIDEO_INFO_N_PLANES (vinfo); p++) {
       const guint8 *data;
       guint8 *dst;
@@ -1113,6 +1150,8 @@ gst_mmal_video_dec_fill_buffer (GstMMALVideoDec * self,
 
       dst = GST_VIDEO_FRAME_PLANE_DATA (&frame, p);
       data = src;
+
+      /* Line-by-line, in each plane */
       for (h = 0; h < dst_height[p]; h++) {
         memcpy (dst, data, dst_width[p]);
         dst += GST_VIDEO_INFO_PLANE_STRIDE (vinfo, p);
@@ -1179,7 +1218,8 @@ gst_mmal_video_dec_handle_decoded_frames (GstMMALVideoDec * self,
       switch (buffer->cmd) {
 
         case MMAL_EVENT_EOS:
-          GST_DEBUG_OBJECT (self, "TODO: Got EOS");
+          GST_DEBUG_OBJECT (self, "Got EOS");
+          flow_ret = GST_FLOW_EOS;
           break;
         case MMAL_EVENT_ERROR:
           /* TODO: Pull-out some useful info. */
@@ -1344,10 +1384,11 @@ static GstFlowReturn
 gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
     GstVideoCodecFrame * frame)
 {
-
-  MMAL_BUFFER_HEADER_T *buffer = NULL;
-  guint input_offset = 0;
+  MappedBuffer *mapped_gst_buffer = NULL;
+  MappedBuffer *previous_mapped_gst_buffer = NULL;
+  MMAL_BUFFER_HEADER_T *mmal_buffer = NULL;
   guint input_size = 0;
+  guint input_offset = 0;
   int64_t pts_microsec = 0;
   GstFlowReturn flow_ret = GST_FLOW_OK;
 
@@ -1383,8 +1424,6 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
     self->started = TRUE;
   }
 
-  /* We have to wait for input buffers. */
-
   input_size = gst_buffer_get_size (frame->input_buffer);
 
   /* GST timestamp is in nanosecs */
@@ -1404,7 +1443,6 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
     pts_microsec = MMAL_TIME_UNKNOWN;
   }
 
-
   while (input_offset < input_size) {
 
     /* We have to wait for an input buffer.
@@ -1412,54 +1450,91 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
 
     GST_DEBUG_OBJECT (self, "Waiting for input buffer...");
 
-    if ((buffer = mmal_queue_timedwait (self->input_buffer_pool->queue, 500)) ==
-        NULL) {
+    if ((mmal_buffer = mmal_queue_timedwait (self->input_buffer_pool->queue,
+                500)) == NULL) {
+
       GST_ERROR_OBJECT (self, "Failed to acquire input buffer!");
       flow_ret = GST_FLOW_ERROR;
-      break;
+      goto done;
     }
 
     GST_DEBUG_OBJECT (self, "Got input buffer");
 
     /* "Resets all variables to default values" */
-    mmal_buffer_header_reset (buffer);
-    buffer->cmd = 0;
+    mmal_buffer_header_reset (mmal_buffer);
+    mmal_buffer->cmd = 0;
 
-    /* Now we have a buffer, write the next bit of the input frame. */
-    buffer->length =
-        MIN (input_size - input_offset, buffer->alloc_size - buffer->offset);
+    /* Use MMAL buffer payload for mapped GStreamer buffer info */
+    mapped_gst_buffer = (MappedBuffer *) mmal_buffer->data;
 
-    gst_buffer_extract (frame->input_buffer, input_offset,
-        buffer->data + buffer->offset, buffer->length);
+    mapped_gst_buffer->buffer = gst_buffer_ref (frame->input_buffer);
+
+    if (previous_mapped_gst_buffer != NULL) {
+
+      mapped_gst_buffer->map_info = previous_mapped_gst_buffer->map_info;
+      mapped_gst_buffer->buffer = previous_mapped_gst_buffer->buffer;
+      previous_mapped_gst_buffer->next = mapped_gst_buffer;
+
+    } else if (!gst_buffer_map (mapped_gst_buffer->buffer,
+            &mapped_gst_buffer->map_info, GST_MAP_READ)) {
+
+      gst_buffer_unref (mapped_gst_buffer->buffer);
+      mmal_buffer_header_release (mmal_buffer);
+
+      GST_ERROR_OBJECT (self, "Failed to map frame input buffer for reading");
+      flow_ret = GST_FLOW_ERROR;
+      goto done;
+    }
+
+    mapped_gst_buffer->next = NULL;
+    mapped_gst_buffer->previous = previous_mapped_gst_buffer;
+
+    mmal_buffer->data = mapped_gst_buffer->map_info.data + input_offset;
+    mmal_buffer->alloc_size = self->dec->input[0]->buffer_size;
+    mmal_buffer->length = MIN (input_size - input_offset,
+        mmal_buffer->alloc_size);
+    mmal_buffer->offset = 0;
+
+    /* Need to save this so we can restore in the MMAL buffer release callback */
+    mmal_buffer->user_data = mapped_gst_buffer;
 
     /* Set PTS */
-    buffer->pts = pts_microsec;
-    buffer->dts = MMAL_TIME_UNKNOWN;
+    mmal_buffer->pts = pts_microsec;
+    mmal_buffer->dts = MMAL_TIME_UNKNOWN;
 
     /* Flags */
     if (input_offset == 0) {
-
-      buffer->flags |= MMAL_BUFFER_HEADER_FLAG_FRAME_START;
+      mmal_buffer->flags |= MMAL_BUFFER_HEADER_FLAG_FRAME_START;
 
       if (GST_VIDEO_CODEC_FRAME_IS_SYNC_POINT (frame)) {
-        buffer->flags |= MMAL_BUFFER_HEADER_FLAG_KEYFRAME;
+        mmal_buffer->flags |= MMAL_BUFFER_HEADER_FLAG_KEYFRAME;
       }
     }
 
-    input_offset += buffer->length;
+    input_offset += mmal_buffer->length;
 
     if (input_offset == input_size) {
-      buffer->flags |= MMAL_BUFFER_HEADER_FLAG_FRAME_END;
+      mmal_buffer->flags |= MMAL_BUFFER_HEADER_FLAG_FRAME_END;
     }
 
     /* Now send the buffer to decoder. */
 
-    if (mmal_port_send_buffer (self->dec->input[0], buffer) != MMAL_SUCCESS) {
+    if (mmal_port_send_buffer (self->dec->input[0], mmal_buffer) !=
+        MMAL_SUCCESS) {
+
       GST_ERROR_OBJECT (self, "Failed to send input buffer to decoder!");
-      mmal_buffer_header_release (buffer);
+
+      /* N.B. We've taken a ref to the GstBuffer, so we need to handle that.
+         Our callback function will do that for us.
+       */
+      gst_mmal_video_dec_return_input_buffer_to_pool (self->dec->input[0],
+          mmal_buffer);
+
       flow_ret = GST_FLOW_ERROR;
-      break;
+      goto done;
     }
+
+    previous_mapped_gst_buffer = mapped_gst_buffer;
   }
 
 done:

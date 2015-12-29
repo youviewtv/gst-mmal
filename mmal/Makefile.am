@@ -2,11 +2,13 @@ plugin_LTLIBRARIES = libgstmmal.la
 
 libgstmmal_la_SOURCES = \
 	gstmmal.c \
+	gstmmalmemory.c \
 	gstmmalh264dec.c \
 	gstmmalvideodec.c \
 	gstmmalvideosink.c
 
 noinst_HEADERS = \
+	gstmmalmemory.h \
 	gstmmalh264dec.h \
 	gstmmalvideodec.h \
 	gstmmalvideosink.h

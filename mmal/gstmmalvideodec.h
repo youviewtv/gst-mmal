@@ -80,6 +80,9 @@ struct _GstMMALVideoDec
   guint32 output_buffer_flags;
 
   GstClockTime last_upstream_ts;
+
+  /* Whether we are using MMAL opaque buffers.  Decided by allocation query. */
+  gboolean opaque;
 };
 
 struct _GstMMALVideoDecClass

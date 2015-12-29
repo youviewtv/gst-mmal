@@ -19,6 +19,7 @@
  */
 
 #include "gstmmalvideodec.h"
+#include "gstmmalmemory.h"
 
 #include <gst/gst.h>
 
@@ -29,6 +30,7 @@
 
 #include <interface/mmal/util/mmal_default_components.h>
 #include <interface/mmal/util/mmal_util.h>
+#include <interface/mmal/util/mmal_util_params.h>
 
 
 GST_DEBUG_CATEGORY_STATIC (gst_mmal_video_dec_debug_category);
@@ -37,16 +39,13 @@ GST_DEBUG_CATEGORY_STATIC (gst_mmal_video_dec_debug_category);
 #define MMAL_TICKS_PER_SECOND 1000000
 #define GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFERS 3
 
-
-static const char gst_mmal_video_dec_src_caps_str[] =
-GST_VIDEO_CAPS_MAKE ("{ I420 }");
-
 static GstStaticPadTemplate gst_mmal_video_dec_src_factory =
-GST_STATIC_PAD_TEMPLATE ("src",
+    GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (gst_mmal_video_dec_src_caps_str));
-
+    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE_WITH_FEATURES
+        (GST_CAPS_FEATURE_MEMORY_MMAL_OPAQUE,
+            "{ I420 }") ";" GST_VIDEO_CAPS_MAKE ("{ I420 }")));
 
 struct MappedBuffer_;
 
@@ -111,6 +110,9 @@ static GstVideoCodecFrame
     * gst_mmal_video_dec_find_nearest_frame (MMAL_BUFFER_HEADER_T * buf,
     GList * frames);
 
+static gboolean gst_mmal_video_dec_decide_allocation (GstVideoDecoder * decoder,
+    GstQuery * query);
+
 static gboolean gst_mmal_video_dec_populate_output_port (GstMMALVideoDec *
     self);
 
@@ -166,6 +168,9 @@ gst_mmal_video_dec_class_init (GstMMALVideoDecClass * klass)
   video_decoder_class->handle_frame =
       GST_DEBUG_FUNCPTR (gst_mmal_video_dec_handle_frame);
 
+  video_decoder_class->decide_allocation =
+      GST_DEBUG_FUNCPTR (gst_mmal_video_dec_decide_allocation);
+
   /* src pad  N.B. Sink is done in derived class, since it knows format. */
   pad_template = gst_static_pad_template_get (&gst_mmal_video_dec_src_factory);
   gst_element_class_add_pad_template (element_class, pad_template);
@@ -187,6 +192,7 @@ gst_mmal_video_dec_init (GstMMALVideoDec * self)
   self->last_upstream_ts = 0;
   self->caps_changed = FALSE;
   self->output_buffer_flags = 0;
+  self->opaque = FALSE;
 }
 
 static gboolean
@@ -430,6 +436,7 @@ gst_mmal_video_get_format_from_mmal (MMAL_FOURCC_T mmal_colorformat)
 
   switch (mmal_colorformat) {
     case MMAL_ENCODING_I420:
+    case MMAL_ENCODING_OPAQUE:
       format = GST_VIDEO_FORMAT_I420;
       break;
 
@@ -563,6 +570,147 @@ gst_mmal_print_port_info (MMAL_PORT_T * port, GstElement * element)
 
 
 /**
+ * We implement this in order to negotiate MMAL opaque buffers, where downstream
+ * supports it.
+ */
+static gboolean
+gst_mmal_video_dec_decide_allocation (GstVideoDecoder * decoder,
+    GstQuery * query)
+{
+  GstMMALVideoDec *self = GST_MMAL_VIDEO_DEC (decoder);
+  GstBufferPool *pool;
+  GstStructure *config;
+
+  GstCaps *caps;
+  gint i, n;
+  GstVideoInfo info;
+
+  self->opaque = FALSE;
+
+  gst_query_parse_allocation (query, &caps, NULL);
+
+  if (caps && gst_video_info_from_caps (&info, caps)
+      && info.finfo->format == GST_VIDEO_FORMAT_I420) {
+
+    gboolean found = FALSE;
+    GstCapsFeatures *feature = gst_caps_get_features (caps, 0);
+
+    /* Prefer an MMAL Opaque allocator if available and we want to use it */
+    n = gst_query_get_n_allocation_params (query);
+
+    for (i = 0; i < n; i++) {
+
+      GstAllocator *allocator;
+      GstAllocationParams params;
+
+      gst_query_parse_nth_allocation_param (query, i, &allocator, &params);
+
+      if (allocator) {
+
+        if (g_strcmp0 (allocator->mem_type, GST_MMAL_OPAQUE_MEMORY_TYPE) == 0) {
+
+          found = TRUE;
+
+          gst_query_set_nth_allocation_param (query, 0, allocator, &params);
+          while (gst_query_get_n_allocation_params (query) > 1) {
+            gst_query_remove_nth_allocation_param (query, 1);
+          }
+        }
+
+        gst_object_unref (allocator);
+
+        if (found) {
+          /* We will use opaque buffers. */
+          GST_DEBUG_OBJECT (self, "Negotiated to use opaque buffers.");
+          self->opaque = TRUE;
+          break;
+        }
+      }
+    }
+
+    /* If try to negotiate with caps feature memory:MMALOpaque
+       and if allocator is not of type memory MMALOpaque then fails.
+       Should not have negotiated MMAL Opaque in allocation query caps
+       otherwise.
+     */
+    if (feature
+        && gst_caps_features_contains (feature,
+            GST_CAPS_FEATURE_MEMORY_MMAL_OPAQUE) && !found) {
+
+      GST_WARNING_OBJECT (self, "Caps indicate MMAL opaque buffers supported, "
+          "but allocator not found!");
+      return FALSE;
+    }
+  }
+
+  if (!GST_VIDEO_DECODER_CLASS
+      (gst_mmal_video_dec_parent_class)->decide_allocation (decoder, query)) {
+    return FALSE;
+  }
+
+  g_assert (gst_query_get_n_allocation_pools (query) > 0);
+  gst_query_parse_nth_allocation_pool (query, 0, &pool, NULL, NULL, NULL);
+  g_assert (pool != NULL);
+
+  config = gst_buffer_pool_get_config (pool);
+
+  if (gst_query_find_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL)) {
+    gst_buffer_pool_config_add_option (config,
+        GST_BUFFER_POOL_OPTION_VIDEO_META);
+  }
+
+  if (self->opaque) {
+
+    /* Downstream proposed MMAL allocator, above.
+
+       In this case, we override the choice of buffer pool with a specialised
+       one that takes care of releasing MMAL buffers when the GstBuffer is
+       returned to the pool.
+
+       Downstream *could* provide this specialised pool as well, but we're
+       providing the MMAL buffer headers, so this seems to make sense.
+
+       I wish we didn't need this specialised pool, and could just use the
+       allocator, but I don't know of another way to unref the mmal header
+       when the buffer is returned to pool (except perhaps some hack with a
+       custom meta on the buffer).
+     */
+
+    GstAllocator *allocator;
+    guint config_size;
+    guint config_min_buffers;
+    guint config_max_buffers;
+    GstAllocationParams allocator_params;
+
+    GST_DEBUG_OBJECT (self, "Creating new MMAL Opaque buffer pool.");
+
+    gst_buffer_pool_config_get_params (config, &caps, &config_size,
+        &config_min_buffers, &config_max_buffers);
+
+    gst_buffer_pool_config_get_allocator (config, &allocator,
+        &allocator_params);
+
+    gst_object_unref (pool);
+    pool = gst_mmal_opaque_buffer_pool_new ();
+
+    gst_buffer_pool_config_set_params (config, caps, config_size,
+        config_min_buffers, config_max_buffers);
+
+    gst_buffer_pool_config_set_allocator (config, allocator, &allocator_params);
+
+    gst_query_set_nth_allocation_pool (query, 0, pool, config_size,
+        config_min_buffers, config_max_buffers);
+  }
+  /* end-if (opaque) */
+
+  gst_buffer_pool_set_config (pool, config);
+  gst_object_unref (pool);
+
+  return TRUE;
+}
+
+
+/**
  * This is called from set_format()
  *
  * TODO: Locking?  omx impl does: GST_VIDEO_DECODER_STREAM_UNLOCK (self);
@@ -594,24 +742,36 @@ gst_mmal_video_dec_update_src_caps (GstMMALVideoDec * self)
      Perhaps there is a simpler way to achieve the same result, but I don't know
      what that is.
    */
-  if (mmal_port_disable (self->dec->output[0]) != MMAL_SUCCESS) {
-    GST_ERROR_OBJECT (self, "Failed to disable output port.");
-    return FALSE;
-  }
+  if (self->dec->output[0]->is_enabled) {
 
-  if (mmal_port_format_commit (self->dec->output[0]) != MMAL_SUCCESS) {
-    GST_ERROR_OBJECT (self, "Failed to commit output port format.");
-    return FALSE;
-  }
+    if (mmal_port_disable (self->dec->output[0]) != MMAL_SUCCESS) {
+      GST_ERROR_OBJECT (self, "Failed to disable output port.");
+      return FALSE;
+    }
 
-  if (mmal_port_enable (self->dec->output[0],
-          &gst_mmal_video_dec_queue_decoded_frame) != MMAL_SUCCESS) {
-    GST_ERROR_OBJECT (self, "Failed to re-enable output port.");
-    return FALSE;
-  }
+    /* FIXME: Chicken-egg: We only find-out if opaque as a result of
+       negotiation with downstream.  However, it's pretty unlikely that this is
+       going to change, once initial caps have been negotiated.
+     */
+    if (self->opaque) {
 
-  /* Make sure the ouput port has buffers, just in case. */
-  gst_mmal_video_dec_populate_output_port (self);
+      output_format->encoding = MMAL_ENCODING_OPAQUE;
+    }
+
+    if (mmal_port_format_commit (self->dec->output[0]) != MMAL_SUCCESS) {
+      GST_ERROR_OBJECT (self, "Failed to commit output port format.");
+      return FALSE;
+    }
+
+    if (mmal_port_enable (self->dec->output[0],
+            &gst_mmal_video_dec_queue_decoded_frame) != MMAL_SUCCESS) {
+      GST_ERROR_OBJECT (self, "Failed to re-enable output port.");
+      return FALSE;
+    }
+
+    /* Make sure the ouput port has buffers, just in case. */
+    gst_mmal_video_dec_populate_output_port (self);
+  }
 
   if (format == GST_VIDEO_FORMAT_UNKNOWN) {
 
@@ -620,8 +780,6 @@ gst_mmal_video_dec_update_src_caps (GstMMALVideoDec * self)
 
     goto error;
   }
-
-  /* TODO: We can communicate interlaced vs progressive here as well. */
 
   state = gst_video_decoder_set_output_state (GST_VIDEO_DECODER (self),
       format, output_format->es->video.crop.width,
@@ -726,10 +884,35 @@ gst_mmal_video_dec_update_src_caps (GstMMALVideoDec * self)
   }
 
 
+  /* The negotiation with downstream.
+
+     We always want to use opaque buffers if we can negotiate that.  However,
+     GstVideoDecoder won't include the needed feature in the caps, so we have
+     to do that ourselves here.  We first try negotiating opaque then, if that
+     fails, we remove the opaque feature and try to negotiate "plain" buffers.
+   */
+  if (state->caps) {
+    gst_caps_unref (state->caps);
+  }
+
+  state->caps = gst_video_info_to_caps (&state->info);
+
+  gst_caps_set_features (state->caps, 0,
+      gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_MMAL_OPAQUE, NULL));
+
   if (!gst_video_decoder_negotiate (GST_VIDEO_DECODER (self))) {
-    gst_video_codec_state_unref (state);
-    GST_ERROR_OBJECT (self, "Failed to negotiate caps with downstream.");
-    goto error;
+
+    GST_INFO_OBJECT (self, "Failed to negotiate opaque with downstream.");
+
+    gst_caps_replace (&state->caps, gst_video_info_to_caps (&state->info));
+
+    if (!gst_video_decoder_negotiate (GST_VIDEO_DECODER (self))) {
+
+      GST_ERROR_OBJECT (self, "Failed to negotiate caps with downstream.");
+
+      gst_video_codec_state_unref (state);
+      goto error;
+    }
   }
 
   /* Don't want to come back into this function until next set_format() */
@@ -857,6 +1040,7 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
   MMAL_PORT_T *input_port = NULL;
   MMAL_ES_FORMAT_T *input_format = NULL;
   MMAL_PORT_T *output_port = NULL;
+  MMAL_ES_FORMAT_T *output_format = NULL;
 
   self = GST_MMAL_VIDEO_DEC (decoder);
   klass = GST_MMAL_VIDEO_DEC_GET_CLASS (decoder);
@@ -1025,14 +1209,39 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
     }
 
 
-    /* This will cause update_src_caps() to be called by handle_decoded_frames()
-       next time we have an output frame from the decoder.  We defer the call
-       until next output frame as the decoder can then figure-out things like
-       framerate and interlaced vs progressive, which we want to set in src
-       caps.
+    /* We need to update src caps here, and go through the allocation query
+       with downstream.  Otherwise, we can't know whether we should use opaque
+       buffers or not on output port.
+     */
+
+    gst_mmal_video_dec_update_src_caps (self);
+
+    /* This will cause update_src_caps() to be called (again) by
+       handle_decoded_frames(), next time we have an output frame from the
+       decoder.
+
+       We defer the call until next output frame as the decoder can then
+       figure-out things like framerate and interlaced vs progressive, which we
+       want to set in src caps.
      */
     self->caps_changed = TRUE;
 
+
+
+    if (self->opaque) {
+
+      GST_DEBUG_OBJECT (self, "Configuring opaque buffers on output port...");
+
+      output_format = output_port->format;
+
+      output_format->encoding = MMAL_ENCODING_OPAQUE;
+
+      if (mmal_port_format_commit (output_port) != MMAL_SUCCESS) {
+        GST_ERROR_OBJECT (self, "Failed to commit output port format.");
+        return FALSE;
+      }
+
+    }
 
     /*
        NOTE: We can also receive notification of output port format changes via
@@ -1048,11 +1257,11 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
     GST_DEBUG_OBJECT (self, "Reconfiguring output buffer pool...");
 
     if (self->output_buffer_pool != NULL) {
-      mmal_pool_destroy (self->output_buffer_pool);
+      mmal_port_pool_destroy (output_port, self->output_buffer_pool);
     }
 
-    self->output_buffer_pool = mmal_pool_create (output_port->buffer_num,
-        output_port->buffer_size);
+    self->output_buffer_pool = mmal_port_pool_create (output_port,
+        output_port->buffer_num, output_port->buffer_size);
 
     /* Recreate the decoded-frames queue. Why? Well, I get an odd assertion
        from MMAL next time I try to retrieve a buffer from it otherwise
@@ -1453,7 +1662,29 @@ gst_mmal_video_dec_handle_decoded_frames (GstMMALVideoDec * self,
             GST_BUFFER_FLAG_SET (frame->output_buffer,
                 self->output_buffer_flags);
 
-            if (!gst_mmal_video_dec_fill_buffer (self, buffer,
+            if (self->opaque) {
+
+              /* Using opaque output buffers.  So the GstMemory in the GstBuffer
+                 should have been allocated by our special allocator.
+                 We just need to fill-in the pointer to the MMAL header.
+               */
+
+
+              GstMemory *mem = gst_buffer_peek_memory (frame->output_buffer,
+                  0);
+
+              if (mem == NULL || !gst_is_mmal_opaque_memory (mem)) {
+
+                GST_ERROR_OBJECT (self, "Expected MMAL Opaque GstMemory!");
+                flow_ret = GST_FLOW_ERROR;
+
+              } else {
+                gst_mmal_opaque_mem_set_mmal_header (mem, buffer);
+              }
+            }
+
+            /* Only copy frame if not using opaque. */
+            else if (!gst_mmal_video_dec_fill_buffer (self, buffer,
                     frame->output_buffer)) {
 
               /* FAIL */
@@ -1466,7 +1697,9 @@ gst_mmal_video_dec_handle_decoded_frames (GstMMALVideoDec * self,
               flow_ret =
                   gst_video_decoder_drop_frame (GST_VIDEO_DECODER (self),
                   frame);
-            } else {
+            }
+
+            if (flow_ret == GST_FLOW_OK) {
 
               GST_DEBUG_OBJECT (self, "Finishing frame...");
 

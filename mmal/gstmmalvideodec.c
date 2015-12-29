@@ -186,6 +186,7 @@ gst_mmal_video_dec_init (GstMMALVideoDec * self)
   self->started = FALSE;
   self->last_upstream_ts = 0;
   self->caps_changed = FALSE;
+  self->output_buffer_flags = 0;
 }
 
 static gboolean
@@ -572,6 +573,7 @@ gst_mmal_video_dec_update_src_caps (GstMMALVideoDec * self)
 {
   GstVideoCodecState *state = NULL;
   MMAL_ES_FORMAT_T *output_format = self->dec->output[0]->format;
+  MMAL_PARAMETER_VIDEO_INTERLACE_TYPE_T interlace_type;
 
   GstVideoFormat format =
       gst_mmal_video_get_format_from_mmal (output_format->encoding);
@@ -628,6 +630,101 @@ gst_mmal_video_dec_update_src_caps (GstMMALVideoDec * self)
   /* Take framerate from output port for src caps. */
   GST_VIDEO_INFO_FPS_N (&state->info) = output_format->es->video.frame_rate.num;
   GST_VIDEO_INFO_FPS_D (&state->info) = output_format->es->video.frame_rate.den;
+
+
+  self->output_buffer_flags = 0;
+
+  /* Query whether interlaced. */
+  interlace_type.hdr.id = MMAL_PARAMETER_VIDEO_INTERLACE_TYPE;
+  interlace_type.hdr.size = sizeof (MMAL_PARAMETER_VIDEO_INTERLACE_TYPE_T);
+
+  if (mmal_port_parameter_get (self->dec->output[0], &interlace_type.hdr) !=
+      MMAL_SUCCESS) {
+
+    GST_ERROR_OBJECT (self, "Failed to query interlace type!");
+
+  } else {
+
+    /* N.B. Although MMAL interlace mode tells us field order, I'm not sure
+       there is anywhere for us to put that in the vinfo?
+
+       In any case, progressive and interlaced frames can both appear in Mixed
+       mode, so we will need to look at each output buffer and set appropriate
+       buffer flags on Gst output buffer.
+
+       NOTE: There seems to be a problem with flags on MMAL output buffers.
+       Deinterlace flags are not set on buffers, even when the output is clearly
+       interlaced.  So all we can do for now is to take what the decoder tells
+       us here to derive flags we will apply to all output GstBuffers that
+       follow.
+     */
+    switch (interlace_type.eMode) {
+
+      case MMAL_InterlaceFieldSingleUpperFirst:
+        /* Fields are stored in one buffer, use the frame ID to get access to the
+           required field.
+
+           Each field has only half the amount of lines as noted in the
+           height property. This mode requires multiple GstVideoMeta metadata
+           to describe the fields.
+         */
+        GST_DEBUG_OBJECT (self, "InterlaceFieldSingleUpperFirst");
+        GST_VIDEO_INFO_INTERLACE_MODE (&state->info) =
+            GST_VIDEO_INTERLACE_MODE_FIELDS;
+        self->output_buffer_flags |= GST_VIDEO_BUFFER_FLAG_INTERLACED;
+        self->output_buffer_flags |= GST_VIDEO_BUFFER_FLAG_TFF;
+        break;
+
+      case MMAL_InterlaceFieldSingleLowerFirst:
+        GST_DEBUG_OBJECT (self, "InterlaceFieldSingleLowerFirst");
+        GST_VIDEO_INFO_INTERLACE_MODE (&state->info) =
+            GST_VIDEO_INTERLACE_MODE_FIELDS;
+        self->output_buffer_flags |= GST_VIDEO_BUFFER_FLAG_INTERLACED;
+        break;
+
+      case MMAL_InterlaceFieldsInterleavedUpperFirst:
+        /* Fields are interleaved in one video frame. Extra buffer flags
+           describe the field order.
+         */
+        GST_DEBUG_OBJECT (self, "InterlaceFieldsInterleavedUpperFirst");
+        GST_VIDEO_INFO_INTERLACE_MODE (&state->info) =
+            GST_VIDEO_INTERLACE_MODE_INTERLEAVED;
+        self->output_buffer_flags |= GST_VIDEO_BUFFER_FLAG_INTERLACED;
+        self->output_buffer_flags |= GST_VIDEO_BUFFER_FLAG_TFF;
+        break;
+
+      case MMAL_InterlaceFieldsInterleavedLowerFirst:
+        GST_DEBUG_OBJECT (self, "InterlaceFieldsInterleavedLowerFirst");
+        GST_VIDEO_INFO_INTERLACE_MODE (&state->info) =
+            GST_VIDEO_INTERLACE_MODE_INTERLEAVED;
+        self->output_buffer_flags |= GST_VIDEO_BUFFER_FLAG_INTERLACED;
+        break;
+
+      case MMAL_InterlaceMixed:
+        /* Frames contains both interlaced and progressive video, the buffer flags
+           describe the frame and fields.
+         */
+        GST_DEBUG_OBJECT (self, "InterlaceMixed");
+        GST_VIDEO_INFO_INTERLACE_MODE (&state->info) =
+            GST_VIDEO_INTERLACE_MODE_MIXED;
+        self->output_buffer_flags |= GST_VIDEO_BUFFER_FLAG_INTERLACED;
+        break;
+
+      case MMAL_InterlaceProgressive:
+      default:
+        /* All frames are progressive */
+        GST_DEBUG_OBJECT (self, "InterlaceProgressive");
+        GST_VIDEO_INFO_INTERLACE_MODE (&state->info) =
+            GST_VIDEO_INTERLACE_MODE_PROGRESSIVE;
+        break;
+    }
+
+    if (interlace_type.bRepeatFirstField) {
+      GST_DEBUG_OBJECT (self, "Repeat first field");
+      self->output_buffer_flags |= GST_VIDEO_BUFFER_FLAG_RFF;
+    }
+  }
+
 
   if (!gst_video_decoder_negotiate (GST_VIDEO_DECODER (self))) {
     gst_video_codec_state_unref (state);
@@ -818,7 +915,6 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
       GST_ERROR_OBJECT (self, "Failed to disable input port!");
       return FALSE;
     }
-
 
     /* Flush now? */
     if (mmal_port_flush (output_port) != MMAL_SUCCESS) {
@@ -1352,6 +1448,10 @@ gst_mmal_video_dec_handle_decoded_frames (GstMMALVideoDec * self,
             GST_ERROR_OBJECT (self, "Failed to allocate output frame!");
 
           } else {
+
+            /* Set any buffer flags for interlace  See: update_src_caps() */
+            GST_BUFFER_FLAG_SET (frame->output_buffer,
+                self->output_buffer_flags);
 
             if (!gst_mmal_video_dec_fill_buffer (self, buffer,
                     frame->output_buffer)) {

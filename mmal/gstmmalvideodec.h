@@ -73,6 +73,12 @@ struct _GstMMALVideoDec
    */
   gboolean caps_changed;
 
+  /* We set this on src caps change to include the interlace flags that should
+     be set on subsequent output buffers.  They are then applied in
+     handle_decoded_frames().
+   */
+  guint32 output_buffer_flags;
+
   GstClockTime last_upstream_ts;
 };
 

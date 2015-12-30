@@ -23,6 +23,7 @@
 #endif
 
 #include "gstmmalvideosink.h"
+#include "gstmmalmemory.h"
 
 #include <gst/video/video.h>
 #include <gst/video/gstvideosink.h>
@@ -32,6 +33,7 @@
 #include <interface/mmal/mmal.h>
 #include <interface/mmal/util/mmal_util.h>
 #include <interface/mmal/util/mmal_default_components.h>
+#include <interface/mmal/util/mmal_util_params.h>
 
 #define MMAL_I420_STRIDE_ALIGN 32
 #define MMAL_I420_WIDTH_ALIGN GST_ROUND_UP_32
@@ -66,6 +68,20 @@ struct _GstMMALVideoSink
 
   MMAL_COMPONENT_T *renderer;
   MMAL_POOL_T *pool;
+
+  /* This is set on caps change.  It tells show_frame() that the port needs
+     reconfiguring.  We wait until we see the first frame because this is how
+     we discover that opaque mode was selected by upstream.
+   */
+  gboolean need_reconfigure;
+
+  /* This is used in propose_allocation() */
+  GstMMALOpaqueAllocator *allocator;
+
+  /* Whether we are receiving opaque MMAL buffers, rather than plain-old raw
+     buffers.  Decided via allocation query negotiation.
+   */
+  gboolean opaque;
 };
 
 struct _GstMMAVideoSinkClass
@@ -93,10 +109,14 @@ static void mmal_input_port_cb (MMAL_PORT_T * port,
     MMAL_BUFFER_HEADER_T * buffer);
 
 static void gst_mmal_video_sink_set_format (MMAL_ES_FORMAT_T * format,
-    GstVideoInfo * vinfo);
+    GstVideoInfo * vinfo, gboolean opaque);
 
 static gboolean gst_mmal_video_sink_set_caps (GstBaseSink * sink,
     GstCaps * caps);
+
+static gboolean gst_mmal_video_sink_propose_allocation (GstBaseSink * sink,
+    GstQuery * query);
+
 static gboolean gst_mmal_video_sink_start (GstBaseSink * sink);
 static gboolean gst_mmal_video_sink_stop (GstBaseSink * sink);
 
@@ -112,8 +132,9 @@ static gboolean gst_mmal_video_sink_enable_renderer (GstMMALVideoSink * self);
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("I420"))
-    );
+    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE_WITH_FEATURES
+        (GST_CAPS_FEATURE_MEMORY_MMAL_OPAQUE,
+            "{ I420 }") ";" GST_VIDEO_CAPS_MAKE ("{ I420 }")));
 
 static void
 gst_mmal_video_sink_class_init (GstMMALVideoSinkClass * klass)
@@ -135,6 +156,8 @@ gst_mmal_video_sink_class_init (GstMMALVideoSinkClass * klass)
   basesink_class->set_caps = GST_DEBUG_FUNCPTR (gst_mmal_video_sink_set_caps);
   basesink_class->start = GST_DEBUG_FUNCPTR (gst_mmal_video_sink_start);
   basesink_class->stop = GST_DEBUG_FUNCPTR (gst_mmal_video_sink_stop);
+  basesink_class->propose_allocation =
+      GST_DEBUG_FUNCPTR (gst_mmal_video_sink_propose_allocation);
 
   videosink_class->show_frame =
       GST_DEBUG_FUNCPTR (gst_mmal_video_sink_show_frame);
@@ -185,9 +208,11 @@ mmal_input_port_cb (MMAL_PORT_T * port, MMAL_BUFFER_HEADER_T * buffer)
   if (buffer->cmd != 0) {
     GST_DEBUG_OBJECT (self, "input port event: %u", buffer->cmd);
   } else {
+
     MappedBuffer *mb = (MappedBuffer *) buffer->user_data;
 
     if (mb) {
+
       gst_buffer_unmap (mb->buffer, &mb->map_info);
       gst_buffer_unref (mb->buffer);
 
@@ -213,16 +238,22 @@ gst_mmal_video_sink_init (GstMMALVideoSink * self)
 
   self->renderer = NULL;
   self->pool = NULL;
+
+  self->need_reconfigure = TRUE;
+
+  self->allocator = NULL;
+  self->opaque = FALSE;
 }
 
 static void
-gst_mmal_video_sink_set_format (MMAL_ES_FORMAT_T * format, GstVideoInfo * vinfo)
+gst_mmal_video_sink_set_format (MMAL_ES_FORMAT_T * format, GstVideoInfo * vinfo,
+    gboolean opaque)
 {
   g_return_if_fail (format != NULL);
   g_return_if_fail (vinfo != NULL);
 
   format->type = MMAL_ES_TYPE_VIDEO;
-  format->encoding = MMAL_ENCODING_I420;
+  format->encoding = opaque ? MMAL_ENCODING_OPAQUE : MMAL_ENCODING_I420;
   format->es->video.crop.width = GST_VIDEO_INFO_WIDTH (vinfo);
   format->es->video.crop.height = GST_VIDEO_INFO_HEIGHT (vinfo);
   format->es->video.width =
@@ -235,6 +266,37 @@ gst_mmal_video_sink_set_format (MMAL_ES_FORMAT_T * format, GstVideoInfo * vinfo)
   format->es->video.par.den = GST_VIDEO_INFO_PAR_D (vinfo);
   format->flags = MMAL_ES_FORMAT_FLAG_FRAMED;
 }
+
+
+static gboolean
+gst_mmal_video_sink_propose_allocation (GstBaseSink * sink, GstQuery * query)
+{
+  GstCaps *caps = NULL;
+  GstCapsFeatures *features = NULL;
+  gboolean need_pool = FALSE;
+
+  GstMMALVideoSink *self = GST_MMAL_VIDEO_SINK (sink);
+
+  gst_query_parse_allocation (query, &caps, &need_pool);
+
+  GST_DEBUG_OBJECT (self, "Allocation query caps: %" GST_PTR_FORMAT, caps);
+
+  features = gst_caps_get_features (caps, 0);
+
+  if (gst_caps_features_contains (features,
+          GST_CAPS_FEATURE_MEMORY_MMAL_OPAQUE)) {
+
+    GST_DEBUG_OBJECT (self, "Opaque MMAL buffers requested.");
+
+    if (self->allocator) {
+      gst_query_add_allocation_param (query, GST_ALLOCATOR (self->allocator),
+          NULL);
+    }
+  }
+
+  return TRUE;
+}
+
 
 static gboolean
 gst_mmal_video_sink_set_caps (GstBaseSink * sink, GstCaps * caps)
@@ -284,7 +346,12 @@ gst_mmal_video_sink_set_caps (GstBaseSink * sink, GstCaps * caps)
     self->vinfo_padded = gst_video_info_copy (&vinfo);
   }
 
-  return gst_mmal_video_sink_configure_renderer (self);
+  /* Next time we see an input buffer, we need to configure port.
+     We need to wait for this in order to see if we're opaque or not.
+   */
+  self->need_reconfigure = TRUE;
+
+  return TRUE;
 }
 
 static gboolean
@@ -335,12 +402,7 @@ gst_mmal_video_sink_start (GstBaseSink * sink)
     return FALSE;
   }
 
-  self->pool = mmal_port_pool_create (input, MMAL_BUFFER_NUM,
-      MAX_I420_BUFFER_SIZE);
-  if (!self->pool) {
-    GST_ERROR_OBJECT (self, "Failer to create port buffer pool");
-    return FALSE;
-  }
+  self->allocator = g_object_new (gst_mmal_opaque_allocator_get_type (), NULL);
 
   return TRUE;
 }
@@ -373,6 +435,8 @@ gst_mmal_video_sink_stop (GstBaseSink * sink)
     gst_video_info_free (self->vinfo_padded);
     self->vinfo_padded = NULL;
   }
+
+  g_clear_object (&self->allocator);
 
   return TRUE;
 }
@@ -426,50 +490,99 @@ gst_mmal_video_sink_show_frame (GstVideoSink * sink, GstBuffer * buffer)
   self = GST_MMAL_VIDEO_SINK (sink);
   GST_TRACE_OBJECT (sink, "show frame");
 
-  g_return_val_if_fail (self->pool != NULL, GST_FLOW_ERROR);
-  g_return_val_if_fail (self->pool->queue != NULL, GST_FLOW_ERROR);
+  GST_DEBUG_OBJECT (sink, "buffer: %p", buffer);
 
-  mmal_buf = mmal_queue_wait (self->pool->queue);
-  g_return_val_if_fail (mmal_buf != NULL, GST_FLOW_ERROR);
+  /* Has there just been a caps change? */
+  if (self->need_reconfigure) {
 
-  if (self->vinfo_padded) {
-    GstMapInfo info;
+    /* Work out from buffer whether opaque buffers were negotiated. */
 
-    if (!gst_buffer_map (buffer, &info, GST_MAP_READ)) {
-      goto error_map_buffer;
+    self->opaque = gst_is_mmal_opaque_memory (gst_buffer_peek_memory (buffer,
+            0));
+
+    if (!gst_mmal_video_sink_configure_renderer (self)) {
+
+      GST_ERROR_OBJECT (self, "Reconfigure failed!");
+      return GST_FLOW_ERROR;
     }
-
-    gst_mmal_video_sink_copy_frame_raw (mmal_buf->data, self->vinfo_padded,
-        info.data, &self->vinfo);
-
-    gst_buffer_unmap (buffer, &info);
-
-    mmal_buf->length = GST_VIDEO_INFO_SIZE (self->vinfo_padded);
-    mmal_buf->user_data = NULL;
-  } else {
-    MappedBuffer *mb = NULL;
-
-    /* Use MMAL buffer payload for mapped GStreamer buffer info */
-    mb = (MappedBuffer *) mmal_buf->data;
-    g_return_val_if_fail (mb != NULL, GST_FLOW_ERROR);
-
-    if (!gst_buffer_map (buffer, &mb->map_info, GST_MAP_READ)) {
-      goto error_map_buffer;
-    }
-
-    mb->buffer = gst_buffer_ref (buffer);
-
-    /* Provide GStreamer buffer data without copying */
-    mmal_buf->data = mb->map_info.data;
-    mmal_buf->length = mb->map_info.size;
-    mmal_buf->user_data = mb;
   }
 
-  mmal_buf->pts = GST_BUFFER_PTS_IS_VALID (buffer) ?
-      GST_TIME_AS_USECONDS (GST_BUFFER_PTS (buffer)) : MMAL_TIME_UNKNOWN;
-  mmal_buf->dts = GST_BUFFER_DTS_IS_VALID (buffer) ?
-      GST_TIME_AS_USECONDS (GST_BUFFER_DTS (buffer)) : MMAL_TIME_UNKNOWN;
-  mmal_buf->flags = MMAL_BUFFER_HEADER_FLAG_FRAME;
+  if (self->opaque) {
+
+    /* Using opaque buffers. Just extract MMAL buffer header from GstMemory */
+
+    mmal_buf =
+        gst_mmal_opaque_mem_get_mmal_header (gst_buffer_peek_memory (buffer,
+            0));
+
+    g_return_val_if_fail (mmal_buf != NULL, GST_FLOW_ERROR);
+
+    /* NOTE: In opaque case, we take a reference to the MMAL buffer *each time
+       we are asked to render it*.
+
+       The reason for this is that we will otherwise double-free the MMAL
+       buffer in the case of pre-roll, where we are asked to present the same
+       frame twice.
+
+       The GstBuffer is holding it's own reference to the MMAL buffer, which will
+       be dropped when the GstBuffer is returned back to it's pool.  This is
+       handled by a specialised MMAL Pool implementation.
+
+       The reference we add here will be removed by our port callback:
+       mmal_input_port_cb()
+     */
+    mmal_buffer_header_acquire (mmal_buf);
+
+  } else {
+
+    /* Plain buffers. */
+
+    g_return_val_if_fail (self->pool != NULL, GST_FLOW_ERROR);
+    g_return_val_if_fail (self->pool->queue != NULL, GST_FLOW_ERROR);
+
+    mmal_buf = mmal_queue_wait (self->pool->queue);
+
+    g_return_val_if_fail (mmal_buf != NULL, GST_FLOW_ERROR);
+
+    if (self->vinfo_padded) {
+      GstMapInfo info;
+
+      if (!gst_buffer_map (buffer, &info, GST_MAP_READ)) {
+        goto error_map_buffer;
+      }
+
+      gst_mmal_video_sink_copy_frame_raw (mmal_buf->data, self->vinfo_padded,
+          info.data, &self->vinfo);
+
+      gst_buffer_unmap (buffer, &info);
+
+      mmal_buf->length = GST_VIDEO_INFO_SIZE (self->vinfo_padded);
+      mmal_buf->user_data = NULL;
+    } else {
+      MappedBuffer *mb = NULL;
+
+      /* Use MMAL buffer payload for mapped GStreamer buffer info */
+      mb = (MappedBuffer *) mmal_buf->data;
+      g_return_val_if_fail (mb != NULL, GST_FLOW_ERROR);
+
+      if (!gst_buffer_map (buffer, &mb->map_info, GST_MAP_READ)) {
+        goto error_map_buffer;
+      }
+
+      mb->buffer = gst_buffer_ref (buffer);
+
+      /* Provide GStreamer buffer data without copying */
+      mmal_buf->data = mb->map_info.data;
+      mmal_buf->length = mb->map_info.size;
+      mmal_buf->user_data = mb;
+    }
+
+    mmal_buf->pts = GST_BUFFER_PTS_IS_VALID (buffer) ?
+        GST_TIME_AS_USECONDS (GST_BUFFER_PTS (buffer)) : MMAL_TIME_UNKNOWN;
+    mmal_buf->dts = GST_BUFFER_DTS_IS_VALID (buffer) ?
+        GST_TIME_AS_USECONDS (GST_BUFFER_DTS (buffer)) : MMAL_TIME_UNKNOWN;
+    mmal_buf->flags = MMAL_BUFFER_HEADER_FLAG_FRAME;
+  }
 
   status = mmal_port_send_buffer (self->renderer->input[0], mmal_buf);
   if (status != MMAL_SUCCESS) {
@@ -495,6 +608,9 @@ gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self)
 
   g_return_val_if_fail (self != NULL, FALSE);
 
+  /* This function should not be called in opaque mode. */
+  g_return_val_if_fail (!self->opaque, FALSE);
+
   vinfo = &self->vinfo;
 
   g_return_val_if_fail (self->renderer != NULL, FALSE);
@@ -516,6 +632,16 @@ gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self)
     return FALSE;
   }
 
+  if (self->pool == NULL) {
+    self->pool = mmal_port_pool_create (input, MMAL_BUFFER_NUM,
+        MAX_I420_BUFFER_SIZE);
+  }
+
+  if (!self->pool) {
+    GST_ERROR_OBJECT (self, "Failer to create port buffer pool");
+    return FALSE;
+  }
+
   GST_DEBUG_OBJECT (self, "MMAL buffer configuration: num=%u, size=%u",
       input->buffer_num, input->buffer_size);
   GST_DEBUG_OBJECT (self, "GStreamer buffer configuration: size=%u, padding=%s",
@@ -529,6 +655,7 @@ gst_mmal_video_sink_configure_renderer (GstMMALVideoSink * self)
 {
   MMAL_PORT_T *input = NULL;
   MMAL_STATUS_T status;
+  gboolean configured = FALSE;
 
   g_return_val_if_fail (self != NULL, FALSE);
   g_return_val_if_fail (self->renderer != NULL, FALSE);
@@ -541,7 +668,7 @@ gst_mmal_video_sink_configure_renderer (GstMMALVideoSink * self)
     gst_mmal_video_sink_disable_renderer (self);
   }
 
-  gst_mmal_video_sink_set_format (input->format, &self->vinfo);
+  gst_mmal_video_sink_set_format (input->format, &self->vinfo, self->opaque);
 
   status = mmal_port_format_commit (input);
   if (status != MMAL_SUCCESS) {
@@ -550,8 +677,12 @@ gst_mmal_video_sink_configure_renderer (GstMMALVideoSink * self)
     return FALSE;
   }
 
-  return gst_mmal_video_sink_configure_pool (self) &&
+  configured = (self->opaque || gst_mmal_video_sink_configure_pool (self)) &&
       gst_mmal_video_sink_enable_renderer (self);
+
+  self->need_reconfigure = !configured;
+
+  return configured;
 }
 
 static void

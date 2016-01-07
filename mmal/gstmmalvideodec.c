@@ -396,6 +396,9 @@ gst_mmal_video_dec_return_input_buffer_to_pool (MMAL_PORT_T * port,
 {
   MappedBuffer *mb = NULL;
 
+  g_return_if_fail (port != NULL);
+  g_return_if_fail (buffer != NULL);
+
   /* We're using the GstBuffer directly, rather than copying into an MMAL
      allocated buffer.  So we need to unmap and unref the GstBuffer once the
      decoder is done with it.
@@ -407,7 +410,10 @@ gst_mmal_video_dec_return_input_buffer_to_pool (MMAL_PORT_T * port,
 
     mb = (MappedBuffer *) buffer->user_data;
 
-    g_return_if_fail (mb != NULL);
+    /* g_return_if_fail() will not decrement reference count of mmal buffer */
+    if (mb == NULL) {
+      goto done;
+    }
 
     /* Was this the last MMAL buffer header pointing at our mapped GST buffer?
        If so, we can unmap it.
@@ -441,6 +447,7 @@ gst_mmal_video_dec_return_input_buffer_to_pool (MMAL_PORT_T * port,
   /* This drops the refcount of the buffer header.  It will be returned to it's
      pool when the refcount reaches zero.
    */
+done:
   mmal_buffer_header_release (buffer);
 }
 
@@ -1970,7 +1977,7 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
       goto done;
     }
 
-    GST_DEBUG_OBJECT (self, "Got input buffer");
+    GST_DEBUG_OBJECT (self, "Got input MMAL buffer(%p)", mmal_buffer);
 
     /* "Resets all variables to default values" */
     mmal_buffer_header_reset (mmal_buffer);
@@ -2034,7 +2041,8 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
     if (mmal_port_send_buffer (self->dec->input[0], mmal_buffer) !=
         MMAL_SUCCESS) {
 
-      GST_ERROR_OBJECT (self, "Failed to send input buffer to decoder!");
+      GST_ERROR_OBJECT (self, "Failed to send input buffer(%p) to decoder!",
+          mmal_buffer);
 
       /* N.B. We've taken a ref to the GstBuffer, so we need to handle that.
          Our callback function will do that for us.
@@ -2047,6 +2055,7 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
     }
 
     previous_mapped_gst_buffer = mapped_gst_buffer;
+    mmal_buffer = NULL;
   }
 
 done:

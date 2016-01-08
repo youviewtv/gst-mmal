@@ -4,12 +4,14 @@ libgstmmal_la_SOURCES = \
 	gstmmal.c \
 	gstmmalmemory.c \
 	gstmmalh264dec.c \
+	gstmmalmpegviddec.c \
 	gstmmalvideodec.c \
 	gstmmalvideosink.c
 
 noinst_HEADERS = \
 	gstmmalmemory.h \
 	gstmmalh264dec.h \
+	gstmmalmpegviddec.h \
 	gstmmalvideodec.h \
 	gstmmalvideosink.h
 

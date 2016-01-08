@@ -26,6 +26,7 @@
 #include "gstmmalh264dec.h"
 #include "gstmmalmpegviddec.h"
 #include "gstmmalwmvdec.h"
+#include "gstmmalvp8dec.h"
 #include "gstmmalvideosink.h"
 
 #include <gst/gst.h>
@@ -45,6 +46,11 @@ plugin_init (GstPlugin * plugin)
 
   if (!gst_element_register (plugin, "mmalwmvdec",
           GST_RANK_PRIMARY + 1, GST_TYPE_MMAL_WMV_DEC)) {
+    return FALSE;
+  }
+
+  if (!gst_element_register (plugin, "mmalvp8dec",
+          GST_RANK_PRIMARY + 1, GST_TYPE_MMAL_VP8_DEC)) {
     return FALSE;
   }
 

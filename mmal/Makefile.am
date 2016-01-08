@@ -7,7 +7,8 @@ libgstmmal_la_SOURCES = \
 	gstmmalmpegviddec.c \
 	gstmmalvideodec.c \
 	gstmmalvideosink.c \
-	gstmmalwmvdec.c
+	gstmmalwmvdec.c \
+	gstmmalvp8dec.c
 
 noinst_HEADERS = \
 	gstmmalmemory.h \
@@ -15,7 +16,8 @@ noinst_HEADERS = \
 	gstmmalmpegviddec.h \
 	gstmmalvideodec.h \
 	gstmmalvideosink.h \
-	gstmmalwmvdec.h
+	gstmmalwmvdec.h \
+	gstmmalvp8dec.h
 
 # N.B. the `-fgnu89-inline` is there to suppress annoying "inline function
 # declared but never defined" warning from VC headers.

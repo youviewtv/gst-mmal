@@ -37,7 +37,10 @@ GST_DEBUG_CATEGORY_STATIC (gst_mmal_video_dec_debug_category);
 #define GST_CAT_DEFAULT gst_mmal_video_dec_debug_category
 
 #define MMAL_TICKS_PER_SECOND 1000000
-#define GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFERS 3
+#define GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFER_HEADERS 3
+
+#define GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFER_HEADERS_OPAQUE_MODE 20
+#define GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFERS_OPAQUE_MODE 20
 
 static GstStaticPadTemplate gst_mmal_video_dec_src_factory =
     GST_STATIC_PAD_TEMPLATE ("src",
@@ -756,6 +759,16 @@ gst_mmal_video_dec_update_src_caps (GstMMALVideoDec * self)
     if (self->opaque) {
 
       output_format->encoding = MMAL_ENCODING_OPAQUE;
+
+      if (mmal_port_parameter_set_uint32 (self->dec->output[0],
+              MMAL_PARAMETER_EXTRA_BUFFERS,
+              GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFERS_OPAQUE_MODE) !=
+          MMAL_SUCCESS) {
+
+        GST_ERROR_OBJECT (self,
+            "Failed to set extra-buffer count on output port!");
+        return FALSE;
+      }
     }
 
     if (mmal_port_format_commit (self->dec->output[0]) != MMAL_SUCCESS) {
@@ -1241,6 +1254,13 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
         return FALSE;
       }
 
+      output_port->buffer_num = output_port->buffer_num_recommended +
+          GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFER_HEADERS_OPAQUE_MODE;
+
+    } else {
+
+      output_port->buffer_num = output_port->buffer_num_recommended +
+          GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFER_HEADERS;
     }
 
     /*
@@ -1248,9 +1268,6 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
        in-band events.  It seems we don't get those most of the time though, so
        I'm also dealing with the output port here.
      */
-
-    output_port->buffer_num = output_port->buffer_num_recommended +
-        GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFERS;
 
     output_port->buffer_size = output_port->buffer_size_recommended;
 

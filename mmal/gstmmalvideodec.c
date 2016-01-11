@@ -1909,6 +1909,7 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
   guint input_size = 0;
   guint input_offset = 0;
   int64_t pts_microsec = 0;
+  int64_t dts_microsec = 0;
   GstFlowReturn flow_ret = GST_FLOW_OK;
 
   GstMMALVideoDec *self = GST_MMAL_VIDEO_DEC (decoder);
@@ -1948,8 +1949,11 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
   /* GST timestamp is in nanosecs */
 
   if (GST_CLOCK_TIME_IS_VALID (frame->pts)) {
-    /* FIXME: Should probably use gst scale() util. */
-    pts_microsec = frame->pts / 1000;
+
+    GST_DEBUG_OBJECT (self, "PTS: %lli", frame->pts);
+
+    pts_microsec = gst_util_uint64_scale (frame->pts, MMAL_TICKS_PER_SECOND,
+        GST_SECOND);
 
     /* N.B. last_upstream_ts is used by drain() */
     self->last_upstream_ts = frame->pts;
@@ -1959,7 +1963,20 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
     }
 
   } else {
+    GST_DEBUG_OBJECT (self, "PTS: UNKNOWN!");
     pts_microsec = MMAL_TIME_UNKNOWN;
+  }
+
+  if (GST_CLOCK_TIME_IS_VALID (frame->dts)) {
+
+    GST_DEBUG_OBJECT (self, "DTS: %lli", frame->dts);
+
+    dts_microsec = gst_util_uint64_scale (frame->dts, MMAL_TICKS_PER_SECOND,
+        GST_SECOND);
+
+  } else {
+    GST_DEBUG_OBJECT (self, "DTS: UNKNOWN!");
+    dts_microsec = MMAL_TIME_UNKNOWN;
   }
 
   while (input_offset < input_size) {
@@ -2022,7 +2039,7 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
 
     /* Set PTS */
     mmal_buffer->pts = pts_microsec;
-    mmal_buffer->dts = MMAL_TIME_UNKNOWN;
+    mmal_buffer->dts = dts_microsec;
 
     /* Flags */
     if (input_offset == 0) {

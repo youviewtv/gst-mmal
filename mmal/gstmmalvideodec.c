@@ -1358,6 +1358,64 @@ gst_mmal_video_dec_flush (GstVideoDecoder * decoder)
 
 
 /**
+ * This function is adapted from gst-omx.
+ *
+ * It is a safeguard against "old" frames that have, for whatever reason either
+ * never been submitted to the decoder, or no output frame was produced
+ * for them.
+ *
+ * We drop the frames to stop GstVideoDecoder hanging-on to them, and eating-up
+ * all the memory.
+ */
+static void
+gst_mmal_video_dec_clean_older_frames (GstMMALVideoDec * self,
+    MMAL_BUFFER_HEADER_T * buf, GList * frames)
+{
+  GList *l;
+  GstClockTime timestamp = gst_util_uint64_scale (buf->pts, GST_SECOND,
+      MMAL_TICKS_PER_SECOND);
+
+  GST_DEBUG_OBJECT (self, "Cleaning older than: %lli", timestamp);
+
+  if (GST_CLOCK_TIME_IS_VALID (timestamp)) {
+    /* We could release all frames stored with pts < timestamp since the
+     * decoder will likely output frames in display order */
+    for (l = frames; l; l = l->next) {
+      GstVideoCodecFrame *tmp = l->data;
+
+      if (tmp->pts < timestamp) {
+        gst_video_decoder_release_frame (GST_VIDEO_DECODER (self), tmp);
+        GST_LOG_OBJECT (self,
+            "Discarding ghost frame %p (#%d) PTS:%" GST_TIME_FORMAT " DTS:%"
+            GST_TIME_FORMAT, tmp, tmp->system_frame_number,
+            GST_TIME_ARGS (tmp->pts), GST_TIME_ARGS (tmp->dts));
+      } else {
+        gst_video_codec_frame_unref (tmp);
+      }
+    }
+  } else {
+    /* We will release all frames with invalid timestamp because we don't even
+     * know if they will be output some day. */
+    for (l = frames; l; l = l->next) {
+      GstVideoCodecFrame *tmp = l->data;
+
+      if (!GST_CLOCK_TIME_IS_VALID (tmp->pts)) {
+        gst_video_decoder_release_frame (GST_VIDEO_DECODER (self), tmp);
+        GST_LOG_OBJECT (self,
+            "Discarding frame %p (#%d) with invalid PTS:%" GST_TIME_FORMAT
+            " DTS:%" GST_TIME_FORMAT, tmp, tmp->system_frame_number,
+            GST_TIME_ARGS (tmp->pts), GST_TIME_ARGS (tmp->dts));
+      } else {
+        gst_video_codec_frame_unref (tmp);
+      }
+    }
+  }
+
+  g_list_free (frames);
+}
+
+
+/**
  * This is lifted from gst-omx
  *
  * The reason it's needed is that the decoder won't always output frames in the
@@ -1637,9 +1695,18 @@ gst_mmal_video_dec_handle_decoded_frames (GstMMALVideoDec * self,
         frame = gst_mmal_video_dec_find_nearest_frame (buffer,
             gst_video_decoder_get_frames (GST_VIDEO_DECODER (self)));
 
-        /* TODO: gst-omx cleans-up older "ghost" frames at this point.
-           We should probably do the same at this point.
+        /* So we have a timestamped MMAL buffer and get, or not, corresponding
+           frame.
+
+           Assuming decoder output frames in display order, frames preceding
+           this frame could be discarded as they seems useless due to e.g.
+           interlaced stream, corrupted input data.
+
+           In any cases, not likely to be seen again. so drop it before they
+           pile up and use all the memory.
          */
+        gst_mmal_video_dec_clean_older_frames (self, buffer,
+            gst_video_decoder_get_frames (GST_VIDEO_DECODER (self)));
 
         if (frame && (deadline = gst_video_decoder_get_max_decode_time
                 (GST_VIDEO_DECODER (self), frame)) < 0) {

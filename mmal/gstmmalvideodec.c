@@ -198,6 +198,31 @@ gst_mmal_video_dec_init (GstMMALVideoDec * self)
   self->opaque = FALSE;
 }
 
+
+static void
+gst_mmal_video_dec_control_port_callback (MMAL_PORT_T * port,
+    MMAL_BUFFER_HEADER_T * buffer)
+{
+  MMAL_STATUS_T status;
+
+  GstMMALVideoDec *self = (GstMMALVideoDec *) port->userdata;
+
+  if (buffer->cmd == MMAL_EVENT_ERROR) {
+
+    status = (MMAL_STATUS_T) * (uint32_t *) buffer->data;
+
+    GST_ERROR_OBJECT (self, "Control port signalled error: %x, %s",
+        status, mmal_status_to_string (status));
+
+  } else {
+    GST_DEBUG_OBJECT (self, "Control port signalled other cmd: %x",
+        buffer->cmd);
+  }
+
+  mmal_buffer_header_release (buffer);
+}
+
+
 static gboolean
 gst_mmal_video_dec_open (GstVideoDecoder * decoder)
 {
@@ -216,6 +241,15 @@ gst_mmal_video_dec_open (GstVideoDecoder * decoder)
 
   self->decoded_frames_queue = mmal_queue_create ();
   self->dec->output[0]->userdata = (void *) self->decoded_frames_queue;
+
+  self->dec->control->userdata = (void *) self;
+
+  if (mmal_port_enable (self->dec->control,
+          gst_mmal_video_dec_control_port_callback) != MMAL_SUCCESS) {
+
+    GST_ERROR_OBJECT (self, "Failed to enable decoder control port!");
+    return FALSE;
+  }
 
   self->started = FALSE;
 

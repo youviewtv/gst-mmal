@@ -1986,23 +1986,26 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
     /* Use MMAL buffer payload for mapped GStreamer buffer info */
     mapped_gst_buffer = (MappedBuffer *) mmal_buffer->data;
 
-    mapped_gst_buffer->buffer = gst_buffer_ref (frame->input_buffer);
-
     if (previous_mapped_gst_buffer != NULL) {
 
       mapped_gst_buffer->map_info = previous_mapped_gst_buffer->map_info;
       mapped_gst_buffer->buffer = previous_mapped_gst_buffer->buffer;
       previous_mapped_gst_buffer->next = mapped_gst_buffer;
 
-    } else if (!gst_buffer_map (mapped_gst_buffer->buffer,
-            &mapped_gst_buffer->map_info, GST_MAP_READ)) {
+    } else {
 
-      gst_buffer_unref (mapped_gst_buffer->buffer);
-      mmal_buffer_header_release (mmal_buffer);
+      mapped_gst_buffer->buffer = gst_buffer_ref (frame->input_buffer);
 
-      GST_ERROR_OBJECT (self, "Failed to map frame input buffer for reading");
-      flow_ret = GST_FLOW_ERROR;
-      goto done;
+      if (!gst_buffer_map (mapped_gst_buffer->buffer,
+              &mapped_gst_buffer->map_info, GST_MAP_READ)) {
+
+        gst_buffer_unref (mapped_gst_buffer->buffer);
+        mmal_buffer_header_release (mmal_buffer);
+
+        GST_ERROR_OBJECT (self, "Failed to map frame input buffer for reading");
+        flow_ret = GST_FLOW_ERROR;
+        goto done;
+      }
     }
 
     mapped_gst_buffer->next = NULL;

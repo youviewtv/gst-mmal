@@ -42,6 +42,14 @@ GST_DEBUG_CATEGORY_STATIC (gst_mmal_video_dec_debug_category);
 #define GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFER_HEADERS_OPAQUE_MODE 20
 #define GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFERS_OPAQUE_MODE 20
 
+#define GST_MMAL_VIDEO_DEC_INPUT_BUFFER_WAIT_FOR_MS 2000
+
+/* N.B. Drain timeout is quite high because with low-bitrate, low-fps stream, we
+   can end-up with many input frames buffered ahead of the EOS, and we want to
+   wait for those to be sent downstream.
+ */
+#define GST_MMAL_VIDEO_DEC_DRAIN_TIMEOUT_MS 10000
+
 static GstStaticPadTemplate gst_mmal_video_dec_src_factory =
     GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
@@ -105,24 +113,27 @@ static gboolean gst_mmal_video_dec_flush (GstVideoDecoder * decoder);
 static GstFlowReturn gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
     GstVideoCodecFrame * frame);
 
-//static GstFlowReturn gst_mmal_video_dec_finish (GstVideoDecoder * decoder);
+static GstFlowReturn gst_mmal_video_dec_finish (GstVideoDecoder * decoder);
 
 static GstFlowReturn gst_mmal_video_dec_drain (GstMMALVideoDec * self);
 
 static GstVideoCodecFrame
-    * gst_mmal_video_dec_find_nearest_frame (MMAL_BUFFER_HEADER_T * buf,
+    * gst_mmal_video_dec_output_find_nearest_frame (MMAL_BUFFER_HEADER_T * buf,
     GList * frames);
 
-static gboolean gst_mmal_video_dec_decide_allocation (GstVideoDecoder * decoder,
-    GstQuery * query);
+static gboolean gst_mmal_video_dec_output_decide_allocation (GstVideoDecoder
+    * decoder, GstQuery * query);
 
-static gboolean gst_mmal_video_dec_populate_output_port (GstMMALVideoDec *
-    self);
+static gboolean gst_mmal_video_dec_output_populate_output_port (GstMMALVideoDec
+    * self);
 
-static gboolean gst_mmal_video_dec_update_src_caps (GstMMALVideoDec * self);
+static GstFlowReturn gst_mmal_video_dec_output_update_src_caps (GstMMALVideoDec
+    * self);
 
-static GstFlowReturn gst_mmal_video_dec_handle_decoded_frames (GstMMALVideoDec *
-    self, uint32_t wait_for_buffer_timeout_ms);
+static GstFlowReturn
+gst_mmal_video_dec_output_reconfigure_output_port (GstMMALVideoDec * self);
+
+static void gst_mmal_video_dec_output_task_loop (GstMMALVideoDec * self);
 
 static GstVideoFormat gst_mmal_video_get_format_from_mmal (MMAL_FOURCC_T
     mmal_colorformat);
@@ -162,7 +173,7 @@ gst_mmal_video_dec_class_init (GstMMALVideoDecClass * klass)
   /* Optional. Called to request subclass to dispatch any pending remaining data
      at EOS. Sub-classes can refuse to decode new data after.
    */
-  // video_decoder_class->finish = GST_DEBUG_FUNCPTR (gst_mmal_video_dec_finish);
+  video_decoder_class->finish = GST_DEBUG_FUNCPTR (gst_mmal_video_dec_finish);
 
   /* GstVideoDecoder vmethods */
   video_decoder_class->set_format =
@@ -172,7 +183,7 @@ gst_mmal_video_dec_class_init (GstMMALVideoDecClass * klass)
       GST_DEBUG_FUNCPTR (gst_mmal_video_dec_handle_frame);
 
   video_decoder_class->decide_allocation =
-      GST_DEBUG_FUNCPTR (gst_mmal_video_dec_decide_allocation);
+      GST_DEBUG_FUNCPTR (gst_mmal_video_dec_output_decide_allocation);
 
   /* src pad  N.B. Sink is done in derived class, since it knows format. */
   pad_template = gst_static_pad_template_get (&gst_mmal_video_dec_src_factory);
@@ -186,19 +197,30 @@ gst_mmal_video_dec_init (GstMMALVideoDec * self)
   gst_video_decoder_set_packetized (GST_VIDEO_DECODER (self), TRUE);
 
   self->dec = NULL;
+  self->started = FALSE;
+  self->output_flow_ret = GST_FLOW_OK;
+
+  self->draining = FALSE;
+  g_mutex_init (&self->drain_lock);
+  g_cond_init (&self->drain_cond);
+
   self->input_state = NULL;
   self->codec_data = NULL;
-  self->decoded_frames_queue = NULL;
   self->input_buffer_pool = NULL;
-  self->output_buffer_pool = NULL;
-  self->started = FALSE;
   self->last_upstream_ts = 0;
+
   self->caps_changed = FALSE;
+  self->output_buffer_pool = NULL;
+  self->decoded_frames_queue = NULL;
   self->output_buffer_flags = 0;
   self->opaque = FALSE;
+  self->output_reconfigured = FALSE;
 }
 
 
+/**
+ * This is called on MMAL thread.
+ */
 static void
 gst_mmal_video_dec_control_port_callback (MMAL_PORT_T * port,
     MMAL_BUFFER_HEADER_T * buffer)
@@ -286,7 +308,10 @@ gst_mmal_video_dec_close (GstVideoDecoder * decoder)
 static void
 gst_mmal_video_dec_finalize (GObject * object)
 {
-  //GstMMALVideoDec *self = GST_MMAL_VIDEO_DEC (object);
+  GstMMALVideoDec *self = GST_MMAL_VIDEO_DEC (object);
+
+  g_mutex_clear (&self->drain_lock);
+  g_cond_clear (&self->drain_cond);
 
   G_OBJECT_CLASS (gst_mmal_video_dec_parent_class)->finalize (object);
 }
@@ -354,7 +379,7 @@ gst_mmal_video_dec_start (GstVideoDecoder * decoder)
 
   self->last_upstream_ts = 0;
 
-  self->started = TRUE;
+  self->output_flow_ret = GST_FLOW_OK;
 
   return TRUE;
 }
@@ -370,7 +395,15 @@ gst_mmal_video_dec_stop (GstVideoDecoder * decoder)
 
   // TODO: Equiv of omx set_flushing()
 
+  gst_pad_stop_task (GST_VIDEO_DECODER_SRC_PAD (decoder));
+
+  self->output_flow_ret = GST_FLOW_FLUSHING;
   self->started = FALSE;
+
+  g_mutex_lock (&self->drain_lock);
+  self->draining = FALSE;
+  g_cond_broadcast (&self->drain_cond);
+  g_mutex_unlock (&self->drain_lock);
 
   gst_buffer_replace (&self->codec_data, NULL);
 
@@ -391,7 +424,7 @@ gst_mmal_video_dec_stop (GstVideoDecoder * decoder)
  * It's associated with the input port at the time the port is enabled.
  */
 static void
-gst_mmal_video_dec_return_input_buffer_to_pool (MMAL_PORT_T * port,
+gst_mmal_video_dec_mmal_return_input_buffer_to_pool (MMAL_PORT_T * port,
     MMAL_BUFFER_HEADER_T * buffer)
 {
   MappedBuffer *mb = NULL;
@@ -457,7 +490,7 @@ done:
  * It's associated with the output port at the time the port is enabled.
  */
 static void
-gst_mmal_video_dec_queue_decoded_frame (MMAL_PORT_T * port,
+gst_mmal_video_dec_mmal_queue_decoded_frame (MMAL_PORT_T * port,
     MMAL_BUFFER_HEADER_T * buffer)
 {
   MMAL_QUEUE_T *queue = (MMAL_QUEUE_T *) port->userdata;
@@ -469,9 +502,6 @@ gst_mmal_video_dec_queue_decoded_frame (MMAL_PORT_T * port,
 /**
  * Bare-bones mapping of supported color formats to GST.  Right now, we will
  * only support I420.
- *
- * TODO: This function needs expanding for other formats, and should be moved to
- * a shared source file.
  */
 static GstVideoFormat
 gst_mmal_video_get_format_from_mmal (MMAL_FOURCC_T mmal_colorformat)
@@ -484,7 +514,6 @@ gst_mmal_video_get_format_from_mmal (MMAL_FOURCC_T mmal_colorformat)
       format = GST_VIDEO_FORMAT_I420;
       break;
 
-      /* TODO: Support other formats.  Opaque format, for instance. */
     default:
       format = GST_VIDEO_FORMAT_UNKNOWN;
       break;
@@ -618,7 +647,7 @@ gst_mmal_print_port_info (MMAL_PORT_T * port, GstElement * element)
  * supports it.
  */
 static gboolean
-gst_mmal_video_dec_decide_allocation (GstVideoDecoder * decoder,
+gst_mmal_video_dec_output_decide_allocation (GstVideoDecoder * decoder,
     GstQuery * query)
 {
   GstMMALVideoDec *self = GST_MMAL_VIDEO_DEC (decoder);
@@ -755,94 +784,51 @@ gst_mmal_video_dec_decide_allocation (GstVideoDecoder * decoder,
 
 
 /**
- * This is called from set_format()
+ * This is called from gst_mmal_video_dec_output_reconfigure_output_port()
+ * and also directly gst_mmal_video_dec_output_task_loop().
  *
- * TODO: Locking?  omx impl does: GST_VIDEO_DECODER_STREAM_UNLOCK (self);
- * Not sure if that is neccessary in the context this is called?
+ * The second case is because once decoder has decoded first frame following
+ * a format change, it can tell us more about the output format.  Specifically,
+ * we are looking for framerate and interlace mode.
+ *
+ * Incidentally, we trust the decoder to tell us framerate and interlace mode
+ * because it can work this out from the stream headers, whereas sink caps from
+ * upstream can easily be wrong.
+ *
+ * This function will be called *with* AND *without* decoder stream lock held.
+ *
  */
-static gboolean
-gst_mmal_video_dec_update_src_caps (GstMMALVideoDec * self)
+static GstFlowReturn
+gst_mmal_video_dec_output_update_src_caps (GstMMALVideoDec * self)
 {
   GstVideoCodecState *state = NULL;
   MMAL_ES_FORMAT_T *output_format = self->dec->output[0]->format;
   MMAL_PARAMETER_VIDEO_INTERLACE_TYPE_T interlace_type;
+  GstFlowReturn flow_ret = GST_FLOW_OK;
+  GstVideoFormat format;
+  GstVideoInterlaceMode interlace_mode = GST_VIDEO_INTERLACE_MODE_PROGRESSIVE;
 
-  GstVideoFormat format =
-      gst_mmal_video_get_format_from_mmal (output_format->encoding);
-
-  /* This requires explanation. The reason we need to twiddle output port
-     enablement and commit the output format here, (instead of in set_format()),
-     is because:
-
-     a) upstream elements don't tell us the right framerate. 200/1? really?
-     b) the decoder can work-out framerate from headers in stream (e.g.H264 SPS)
-     c) we don't seem to get any "port settings changed" event on the output
-     port, as we might expect.
-     d) the decoder will need to see at least the first frame before it can work
-     out framerate.
-     e) the output port format doesn't seem to be updated unless we do this
-     little dance of disable, commit format, and re-enable the output port.
-
-     Perhaps there is a simpler way to achieve the same result, but I don't know
-     what that is.
+  /* Without this, the framerate will not be up-to-date when we read it from
+     output port format.
    */
-  if (self->dec->output[0]->is_enabled) {
+  if (mmal_port_format_commit (self->dec->output[0]) != MMAL_SUCCESS) {
 
-    if (mmal_port_disable (self->dec->output[0]) != MMAL_SUCCESS) {
-      GST_ERROR_OBJECT (self, "Failed to disable output port.");
-      return FALSE;
-    }
-
-    /* FIXME: Chicken-egg: We only find-out if opaque as a result of
-       negotiation with downstream.  However, it's pretty unlikely that this is
-       going to change, once initial caps have been negotiated.
+    /* N.B. We don't error out on this as we're only doing it here so we can
+       read-back framerate, and there's not a lot we can do about it anyway.
      */
-    if (self->opaque) {
-
-      output_format->encoding = MMAL_ENCODING_OPAQUE;
-
-      if (mmal_port_parameter_set_uint32 (self->dec->output[0],
-              MMAL_PARAMETER_EXTRA_BUFFERS,
-              GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFERS_OPAQUE_MODE) !=
-          MMAL_SUCCESS) {
-
-        GST_ERROR_OBJECT (self,
-            "Failed to set extra-buffer count on output port!");
-        return FALSE;
-      }
-    }
-
-    if (mmal_port_format_commit (self->dec->output[0]) != MMAL_SUCCESS) {
-      GST_ERROR_OBJECT (self, "Failed to commit output port format.");
-      return FALSE;
-    }
-
-    if (mmal_port_enable (self->dec->output[0],
-            &gst_mmal_video_dec_queue_decoded_frame) != MMAL_SUCCESS) {
-      GST_ERROR_OBJECT (self, "Failed to re-enable output port.");
-      return FALSE;
-    }
-
-    /* Make sure the ouput port has buffers, just in case. */
-    gst_mmal_video_dec_populate_output_port (self);
+    GST_WARNING_OBJECT (self, "Failed to commit output format!");
   }
+
+  format = gst_mmal_video_get_format_from_mmal (output_format->encoding);
 
   if (format == GST_VIDEO_FORMAT_UNKNOWN) {
 
     GST_ERROR_OBJECT (self, "Unsupported color format: %lu",
         (unsigned long) output_format->encoding);
 
+    flow_ret = GST_FLOW_NOT_NEGOTIATED;
     goto error;
   }
-
-  state = gst_video_decoder_set_output_state (GST_VIDEO_DECODER (self),
-      format, output_format->es->video.crop.width,
-      output_format->es->video.crop.height, self->input_state);
-
-  /* Take framerate from output port for src caps. */
-  GST_VIDEO_INFO_FPS_N (&state->info) = output_format->es->video.frame_rate.num;
-  GST_VIDEO_INFO_FPS_D (&state->info) = output_format->es->video.frame_rate.den;
-
 
   self->output_buffer_flags = 0;
 
@@ -881,16 +867,14 @@ gst_mmal_video_dec_update_src_caps (GstMMALVideoDec * self)
            to describe the fields.
          */
         GST_DEBUG_OBJECT (self, "InterlaceFieldSingleUpperFirst");
-        GST_VIDEO_INFO_INTERLACE_MODE (&state->info) =
-            GST_VIDEO_INTERLACE_MODE_FIELDS;
+        interlace_mode = GST_VIDEO_INTERLACE_MODE_FIELDS;
         self->output_buffer_flags |= GST_VIDEO_BUFFER_FLAG_INTERLACED;
         self->output_buffer_flags |= GST_VIDEO_BUFFER_FLAG_TFF;
         break;
 
       case MMAL_InterlaceFieldSingleLowerFirst:
         GST_DEBUG_OBJECT (self, "InterlaceFieldSingleLowerFirst");
-        GST_VIDEO_INFO_INTERLACE_MODE (&state->info) =
-            GST_VIDEO_INTERLACE_MODE_FIELDS;
+        interlace_mode = GST_VIDEO_INTERLACE_MODE_FIELDS;
         self->output_buffer_flags |= GST_VIDEO_BUFFER_FLAG_INTERLACED;
         break;
 
@@ -899,16 +883,14 @@ gst_mmal_video_dec_update_src_caps (GstMMALVideoDec * self)
            describe the field order.
          */
         GST_DEBUG_OBJECT (self, "InterlaceFieldsInterleavedUpperFirst");
-        GST_VIDEO_INFO_INTERLACE_MODE (&state->info) =
-            GST_VIDEO_INTERLACE_MODE_INTERLEAVED;
+        interlace_mode = GST_VIDEO_INTERLACE_MODE_INTERLEAVED;
         self->output_buffer_flags |= GST_VIDEO_BUFFER_FLAG_INTERLACED;
         self->output_buffer_flags |= GST_VIDEO_BUFFER_FLAG_TFF;
         break;
 
       case MMAL_InterlaceFieldsInterleavedLowerFirst:
         GST_DEBUG_OBJECT (self, "InterlaceFieldsInterleavedLowerFirst");
-        GST_VIDEO_INFO_INTERLACE_MODE (&state->info) =
-            GST_VIDEO_INTERLACE_MODE_INTERLEAVED;
+        interlace_mode = GST_VIDEO_INTERLACE_MODE_INTERLEAVED;
         self->output_buffer_flags |= GST_VIDEO_BUFFER_FLAG_INTERLACED;
         break;
 
@@ -917,8 +899,7 @@ gst_mmal_video_dec_update_src_caps (GstMMALVideoDec * self)
            describe the frame and fields.
          */
         GST_DEBUG_OBJECT (self, "InterlaceMixed");
-        GST_VIDEO_INFO_INTERLACE_MODE (&state->info) =
-            GST_VIDEO_INTERLACE_MODE_MIXED;
+        interlace_mode = GST_VIDEO_INTERLACE_MODE_MIXED;
         self->output_buffer_flags |= GST_VIDEO_BUFFER_FLAG_INTERLACED;
         break;
 
@@ -926,8 +907,7 @@ gst_mmal_video_dec_update_src_caps (GstMMALVideoDec * self)
       default:
         /* All frames are progressive */
         GST_DEBUG_OBJECT (self, "InterlaceProgressive");
-        GST_VIDEO_INFO_INTERLACE_MODE (&state->info) =
-            GST_VIDEO_INTERLACE_MODE_PROGRESSIVE;
+        interlace_mode = GST_VIDEO_INTERLACE_MODE_PROGRESSIVE;
         break;
     }
 
@@ -937,6 +917,20 @@ gst_mmal_video_dec_update_src_caps (GstMMALVideoDec * self)
     }
   }
 
+  /* Now we need the lock.  N.B. The lock uses recursive mutex, so if we
+     entered this function with the lock already held, that should still be OK
+   */
+  GST_VIDEO_DECODER_STREAM_LOCK (self);
+
+  state = gst_video_decoder_set_output_state (GST_VIDEO_DECODER (self),
+      format, output_format->es->video.crop.width,
+      output_format->es->video.crop.height, self->input_state);
+
+  /* Take framerate from output port for src caps. */
+  GST_VIDEO_INFO_FPS_N (&state->info) = output_format->es->video.frame_rate.num;
+  GST_VIDEO_INFO_FPS_D (&state->info) = output_format->es->video.frame_rate.den;
+
+  GST_VIDEO_INFO_INTERLACE_MODE (&state->info) = interlace_mode;
 
   /* The negotiation with downstream.
 
@@ -965,18 +959,26 @@ gst_mmal_video_dec_update_src_caps (GstMMALVideoDec * self)
       GST_ERROR_OBJECT (self, "Failed to negotiate caps with downstream.");
 
       gst_video_codec_state_unref (state);
+
+      flow_ret = GST_FLOW_NOT_NEGOTIATED;
+      GST_VIDEO_DECODER_STREAM_UNLOCK (self);
       goto error;
     }
   }
 
-  /* Don't want to come back into this function until next set_format() */
+  GST_VIDEO_DECODER_STREAM_UNLOCK (self);
+
+  /* Prevent re-entry into this function from task loop.
+     NOTE: caps_changed is protected by src pad mutex, not the main decoder
+     mutex.
+   */
   self->caps_changed = FALSE;
 
-  return TRUE;
+  return flow_ret;
 
 error:
   /* N.B. would release stream lock here, if acquired. */
-  return FALSE;
+  return flow_ret;
 }
 
 
@@ -995,6 +997,8 @@ error:
  * but that more data may arrive after. (e.g. at segment end). Sub-classes
  * should be prepared to handle new data afterward, or seamless segment
  * processing will break."
+ *
+ * This will be called *with* decoder stream lock held.
  */
 static GstFlowReturn
 gst_mmal_video_dec_drain (GstMMALVideoDec * self)
@@ -1002,25 +1006,31 @@ gst_mmal_video_dec_drain (GstMMALVideoDec * self)
   MMAL_BUFFER_HEADER_T *buffer = NULL;
   GstFlowReturn flow_ret = GST_FLOW_OK;
 
+  gint64 wait_until;
+
+  if (!self->started) {
+    GST_DEBUG_OBJECT (self, "Output thread not started yet. Nothing to drain.");
+    return GST_FLOW_OK;
+  }
+
   if (self->input_buffer_pool == NULL) {
     /* We probably haven't set initial format yet.  Don't worry. */
     return GST_FLOW_OK;
 
   } else {
 
-    if (!gst_mmal_video_dec_populate_output_port (self)) {
-      GST_ERROR_OBJECT (self, "Failed to populate output port!");
-      return GST_FLOW_ERROR;
-    }
+    /* Yield the "big lock" before blocking on input buffer avail. */
+    GST_VIDEO_DECODER_STREAM_UNLOCK (self);
 
     /* Grab a buffer */
-
     GST_DEBUG_OBJECT (self, "Waiting for input buffer...");
 
-    if ((buffer = mmal_queue_timedwait (self->input_buffer_pool->queue, 500)) ==
-        NULL) {
+    if ((buffer = mmal_queue_timedwait (self->input_buffer_pool->queue,
+                GST_MMAL_VIDEO_DEC_INPUT_BUFFER_WAIT_FOR_MS)) == NULL) {
+
       GST_ERROR_OBJECT (self, "Failed to acquire input buffer!");
-      return GST_FLOW_ERROR;
+      flow_ret = GST_FLOW_ERROR;
+      goto no_input_buffer;
     }
 
     GST_DEBUG_OBJECT (self, "Got input buffer");
@@ -1032,7 +1042,7 @@ gst_mmal_video_dec_drain (GstMMALVideoDec * self)
     buffer->flags |= MMAL_BUFFER_HEADER_FLAG_EOS;
 
     /* Avoid trying to unref GstBuffer when releasing MMAL input buffer.
-       See: gst_mmal_video_dec_return_input_buffer_to_pool().
+       See: gst_mmal_video_dec_mmal_return_input_buffer_to_pool().
      */
     buffer->user_data = NULL;
 
@@ -1042,46 +1052,77 @@ gst_mmal_video_dec_drain (GstMMALVideoDec * self)
     GST_DEBUG_OBJECT (self, "Sending EOS with pts: %" G_GUINT64_FORMAT,
         (guint64) buffer->pts);
 
+    /* Hold this mutex before sending EOS buffer, otherwise we have a race. */
+    g_mutex_lock (&self->drain_lock);
+    self->draining = TRUE;
+
     if (mmal_port_send_buffer (self->dec->input[0], buffer) != MMAL_SUCCESS) {
+
       GST_ERROR_OBJECT (self, "Failed to send input buffer to decoder!");
+
       mmal_buffer_header_release (buffer);
-      return GST_FLOW_ERROR;
+
+      flow_ret = GST_FLOW_ERROR;
+      goto drain_failed;
     }
 
     /* OK, so now we've sent EOS to decoder.  Wait for an EOS buffer to plop
-       out the other end.
+       out the other end.  This will be picked-up by the output thread, which
+       we're hoping will then signal the condition variable!
 
-       NOTE: We do this in a loop because there could well be pending output
-       frames before the EOS, and if all output buffers are in use we will need
-       at least one of these to be recycled back to the decoder before it can
-       produce an EOS output buffer.  That's why I call populate_output_port()
-       each time round the loop.
+       N.B. there may be pending output frames in front of the EOS, which will
+       be sent downstream.
      */
 
-    while ((flow_ret = gst_mmal_video_dec_handle_decoded_frames (self, 500)) ==
-        GST_FLOW_OK) {
-      gst_mmal_video_dec_populate_output_port (self);
-    }
+    wait_until = g_get_monotonic_time () +
+        1000 * GST_MMAL_VIDEO_DEC_DRAIN_TIMEOUT_MS;
 
-    /* We're here because either we got the EOS we were looking for, or there
-       was some error.
-     */
-    if (flow_ret != GST_FLOW_EOS) {
-      GST_ERROR_OBJECT (self, "Decoder failed to signal EOS on output port!");
-      return GST_FLOW_ERROR;
+    if (!g_cond_wait_until (&self->drain_cond, &self->drain_lock, wait_until)) {
+
+      GST_ERROR_OBJECT (self, "Drain failed (timeout)!");
+
+      flow_ret = GST_FLOW_ERROR;
+      goto drain_failed;
     }
 
     GST_DEBUG_OBJECT (self, "Drained decoder.");
 
-    return GST_FLOW_OK;
-  }
+  drain_failed:
+    self->draining = FALSE;
+    g_mutex_unlock (&self->drain_lock);
 
+  no_input_buffer:
+    GST_VIDEO_DECODER_STREAM_LOCK (self);
+
+    return flow_ret;
+  }
+}
+
+
+/**
+ * (Optional) vmethod called by GstVideoDecoder at EOS.
+ *
+ * We want to drain and pause output task at EOS.
+ */
+static GstFlowReturn
+gst_mmal_video_dec_finish (GstVideoDecoder * decoder)
+{
+  GstMMALVideoDec *self = GST_MMAL_VIDEO_DEC (decoder);
+
+  return gst_mmal_video_dec_drain (self);
 }
 
 
 /**
  * This is called by the GstVideoDecoder baseclass to let us know the input
  * format has changed.
+ *
+ * This will be called *with* decoder stream lock held.
+ *
+ * NOTE: We only deal with configuring the input side in this function,
+ * including input port configuration.  The output side configuration is
+ * done on the output thread - triggered by "caps_changed" flag, which we set
+ * here.
  */
 static gboolean
 gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
@@ -1093,8 +1134,6 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
   gboolean is_format_change = FALSE;
   MMAL_PORT_T *input_port = NULL;
   MMAL_ES_FORMAT_T *input_format = NULL;
-  MMAL_PORT_T *output_port = NULL;
-  MMAL_ES_FORMAT_T *output_format = NULL;
 
   self = GST_MMAL_VIDEO_DEC (decoder);
   klass = GST_MMAL_VIDEO_DEC_GET_CLASS (decoder);
@@ -1102,7 +1141,6 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
   GST_DEBUG_OBJECT (self, "Setting new caps %" GST_PTR_FORMAT, state->caps);
 
   input_port = self->dec->input[0];
-  output_port = self->dec->output[0];
 
   input_format = input_port->format;
 
@@ -1132,6 +1170,7 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
 
     if (gst_mmal_video_dec_drain (self) != GST_FLOW_OK) {
       GST_ERROR_OBJECT (self, "Drain failed!");
+      return FALSE;
     }
 
     /*
@@ -1140,23 +1179,11 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
        falls-back to disabling if that fails.
      */
 
-    if (output_port->is_enabled && mmal_port_disable (output_port) !=
-        MMAL_SUCCESS) {
-      GST_ERROR_OBJECT (self, "Failed to disable output port!");
-      return FALSE;
-    }
-
-
     if (input_port->is_enabled &&
         mmal_port_disable (input_port) != MMAL_SUCCESS) {
 
       GST_ERROR_OBJECT (self, "Failed to disable input port!");
       return FALSE;
-    }
-
-    /* Flush now? */
-    if (mmal_port_flush (output_port) != MMAL_SUCCESS) {
-      GST_ERROR_OBJECT (self, "Failed to flush output port.");
     }
 
     if (mmal_port_flush (input_port) != MMAL_SUCCESS) {
@@ -1256,89 +1283,19 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
     }
 
     if (mmal_port_enable (input_port,
-            &gst_mmal_video_dec_return_input_buffer_to_pool) != MMAL_SUCCESS) {
+            &gst_mmal_video_dec_mmal_return_input_buffer_to_pool) !=
+        MMAL_SUCCESS) {
 
       GST_ERROR_OBJECT (self, "Failed to enable input port!");
       return FALSE;
     }
 
-
-    /* We need to update src caps here, and go through the allocation query
-       with downstream.  Otherwise, we can't know whether we should use opaque
-       buffers or not on output port.
+    /* This will trigger reconfiguration of the output side, on the output
+       thread.
      */
-
-    gst_mmal_video_dec_update_src_caps (self);
-
-    /* This will cause update_src_caps() to be called (again) by
-       handle_decoded_frames(), next time we have an output frame from the
-       decoder.
-
-       We defer the call until next output frame as the decoder can then
-       figure-out things like framerate and interlaced vs progressive, which we
-       want to set in src caps.
-     */
+    GST_PAD_STREAM_LOCK (GST_VIDEO_DECODER_SRC_PAD (self));
     self->caps_changed = TRUE;
-
-
-
-    if (self->opaque) {
-
-      GST_DEBUG_OBJECT (self, "Configuring opaque buffers on output port...");
-
-      output_format = output_port->format;
-
-      output_format->encoding = MMAL_ENCODING_OPAQUE;
-
-      if (mmal_port_format_commit (output_port) != MMAL_SUCCESS) {
-        GST_ERROR_OBJECT (self, "Failed to commit output port format.");
-        return FALSE;
-      }
-
-      output_port->buffer_num = output_port->buffer_num_recommended +
-          GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFER_HEADERS_OPAQUE_MODE;
-
-    } else {
-
-      output_port->buffer_num = output_port->buffer_num_recommended +
-          GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFER_HEADERS;
-    }
-
-    /*
-       NOTE: We can also receive notification of output port format changes via
-       in-band events.  It seems we don't get those most of the time though, so
-       I'm also dealing with the output port here.
-     */
-
-    output_port->buffer_size = output_port->buffer_size_recommended;
-
-    GST_DEBUG_OBJECT (self, "Reconfiguring output buffer pool...");
-
-    if (self->output_buffer_pool != NULL) {
-      mmal_port_pool_destroy (output_port, self->output_buffer_pool);
-    }
-
-    self->output_buffer_pool = mmal_port_pool_create (output_port,
-        output_port->buffer_num, output_port->buffer_size);
-
-    /* Recreate the decoded-frames queue. Why? Well, I get an odd assertion
-       from MMAL next time I try to retrieve a buffer from it otherwise
-       (contains NULL buffer header).
-     */
-
-    if (self->decoded_frames_queue) {
-      mmal_queue_destroy (self->decoded_frames_queue);
-      self->decoded_frames_queue = mmal_queue_create ();
-      output_port->userdata = (void *) self->decoded_frames_queue;
-    }
-
-
-    if (mmal_port_enable (output_port,
-            &gst_mmal_video_dec_queue_decoded_frame) != MMAL_SUCCESS) {
-
-      GST_ERROR_OBJECT (self, "Failed to enable output port!");
-      return FALSE;
-    }
+    GST_PAD_STREAM_UNLOCK (GST_VIDEO_DECODER_SRC_PAD (self));
 
     if (!self->dec->is_enabled && mmal_component_enable (self->dec) !=
         MMAL_SUCCESS) {
@@ -1349,9 +1306,6 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
 
     GST_DEBUG_OBJECT (self, "Input port info:");
     gst_mmal_print_port_info (input_port, GST_ELEMENT (self));
-
-    GST_DEBUG_OBJECT (self, "Output port info:");
-    gst_mmal_print_port_info (output_port, GST_ELEMENT (self));
   }
   /* end-if (is_format_change) */
 
@@ -1407,9 +1361,13 @@ gst_mmal_video_dec_flush (GstVideoDecoder * decoder)
  *
  * We drop the frames to stop GstVideoDecoder hanging-on to them, and eating-up
  * all the memory.
+ *
+ * This function will be called from gst_mmal_video_dec_output_task_loop().
+ *
+ * Will be called *with* decoder stream lock held.
  */
 static void
-gst_mmal_video_dec_clean_older_frames (GstMMALVideoDec * self,
+gst_mmal_video_dec_output_clean_older_frames (GstMMALVideoDec * self,
     MMAL_BUFFER_HEADER_T * buf, GList * frames)
 {
   GList *l;
@@ -1471,9 +1429,13 @@ gst_mmal_video_dec_clean_older_frames (GstMMALVideoDec * self,
  *
  * NOTE: We could perhaps avoid this if userdata set on the input buffers were
  * propagated to the output buffers - something to check.
+ *
+ * This function will be called from gst_mmal_video_dec_output_task_loop().
+ *
+ * Will be called *with* decoder stream lock held.
  */
 GstVideoCodecFrame *
-gst_mmal_video_dec_find_nearest_frame (MMAL_BUFFER_HEADER_T * buf,
+gst_mmal_video_dec_output_find_nearest_frame (MMAL_BUFFER_HEADER_T * buf,
     GList * frames)
 {
   GstVideoCodecFrame *best = NULL;
@@ -1516,15 +1478,14 @@ gst_mmal_video_dec_find_nearest_frame (MMAL_BUFFER_HEADER_T * buf,
  * This is lifted (and adapted) from gst-omx (gstomxvideodec.c), with some
  * simplification, since we are only supporting I420.
  *
- * It is used by gst_mmal_video_dec_handle_decoded_frames(), when not using
- * opaque output buffers and doing dumb copy from decoder output buffer to
+ * It is used by gst_mmal_video_dec_output_task_loop(), when not
+ * using opaque output buffers and doing dumb copy from decoder output buffer to
  * frame GstBuffer.
  *
- * NOTE: This needs further work.  The way slices and strides are represented
- * is different in MMAL.
+ * Will be called *with* decoder stream lock.
  */
 static gboolean
-gst_mmal_video_dec_fill_buffer (GstMMALVideoDec * self,
+gst_mmal_video_dec_output_fill_buffer (GstMMALVideoDec * self,
     MMAL_BUFFER_HEADER_T * inbuf, GstBuffer * outbuf)
 {
   GstVideoCodecState *state =
@@ -1642,36 +1603,238 @@ done:
 }
 
 
+
 /**
- * NOTE: This function is used by handle_frame() during normal processing, and
- * also by drain() to wait for EOS event.  In the former case, we don't wait
- * for buffers, but just take whatever is available.  In the latter, we will
- * wait - but only for the first decoded frame.  We will process any others that
- * happen to be ready after that one, but we will never block waiting for more
- * than one.
+ * This just feeds any available output buffers to the decoder output port.
+ * It's called only from gst_mmal_video_dec_output_task_loop().
+ *
+ * Will be called *without* decoder stream lock.
  */
-static GstFlowReturn
-gst_mmal_video_dec_handle_decoded_frames (GstMMALVideoDec * self,
-    uint32_t wait_for_buffer_timeout_ms)
+static gboolean
+gst_mmal_video_dec_output_populate_output_port (GstMMALVideoDec * self)
 {
   MMAL_BUFFER_HEADER_T *buffer = NULL;
-  GstVideoCodecFrame *frame = NULL;
-  GstClockTimeDiff deadline;
+
+  /* Send empty buffers to the output port of the decoder to allow the decoder
+     to start producing frames as soon as it gets input data.
+   */
+
+  while ((buffer = mmal_queue_get (self->output_buffer_pool->queue)) != NULL) {
+
+    GST_DEBUG_OBJECT (self, "Sending empty buffer to output port...");
+
+    mmal_buffer_header_reset (buffer);
+
+    if (mmal_port_send_buffer (self->dec->output[0], buffer) != MMAL_SUCCESS) {
+      GST_ERROR_OBJECT (self, "Failed to send empty output buffer to outport!");
+      return FALSE;
+    }
+  }
+
+  return TRUE;
+}
+
+
+/**
+ * Reconfigure the output port settings.
+ *
+ * This is called from gst_mmal_video_dec_output_task_loop() on the output task
+ * thread in response to a caps change on the sink.
+ *
+ * It will be called *without* the big decoder stream lock held.
+ */
+static GstFlowReturn
+gst_mmal_video_dec_output_reconfigure_output_port (GstMMALVideoDec * self)
+{
+  MMAL_PORT_T *output_port = NULL;
+  MMAL_ES_FORMAT_T *output_format = NULL;
   GstFlowReturn flow_ret = GST_FLOW_OK;
 
-  if (wait_for_buffer_timeout_ms == 0) {
-    /* Don't block.  Just take whatever is available. */
-    if ((buffer = mmal_queue_get (self->decoded_frames_queue)) == NULL) {
-      return GST_FLOW_OK;
-    }
-  } else if ((buffer = mmal_queue_timedwait (self->decoded_frames_queue,
-              wait_for_buffer_timeout_ms)) == NULL) {
-    /* We consider it an error in this case. */
-    GST_WARNING_OBJECT (self, "Timed-out waiting for output decoded frame.");
+  GST_DEBUG_OBJECT (self, "Reconfiguring output port...");
+
+  output_port = self->dec->output[0];
+
+
+  if (output_port->is_enabled && mmal_port_disable (output_port) !=
+      MMAL_SUCCESS) {
+    GST_ERROR_OBJECT (self, "Failed to disable output port!");
     return GST_FLOW_ERROR;
   }
 
-  while (buffer && flow_ret == GST_FLOW_OK) {
+  /* We need to update src caps here, and go through the allocation query
+     with downstream.  Otherwise, we can't know whether we should use opaque
+     buffers or not on output port.
+   */
+
+  if ((flow_ret = gst_mmal_video_dec_output_update_src_caps (self)) !=
+      GST_FLOW_OK) {
+    return flow_ret;
+  }
+
+  if (self->opaque) {
+
+    GST_DEBUG_OBJECT (self, "Configuring opaque buffers on output port...");
+
+    output_format = output_port->format;
+
+    output_format->encoding = MMAL_ENCODING_OPAQUE;
+
+    if (mmal_port_parameter_set_uint32 (self->dec->output[0],
+            MMAL_PARAMETER_EXTRA_BUFFERS,
+            GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFERS_OPAQUE_MODE) !=
+        MMAL_SUCCESS) {
+
+      GST_ERROR_OBJECT (self,
+          "Failed to set extra-buffer count on output port!");
+      return GST_FLOW_ERROR;
+    }
+
+    if (mmal_port_format_commit (output_port) != MMAL_SUCCESS) {
+      GST_ERROR_OBJECT (self, "Failed to commit output port format.");
+      return GST_FLOW_ERROR;
+    }
+
+    output_port->buffer_num = output_port->buffer_num_recommended +
+        GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFER_HEADERS_OPAQUE_MODE;
+
+  } else {
+
+    output_port->buffer_num = output_port->buffer_num_recommended +
+        GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFER_HEADERS;
+  }
+
+  /*
+     NOTE: We can also receive notification of output port format changes via
+     in-band events.  It seems we don't get those most of the time though, so
+     I'm also dealing with the output port here.
+   */
+
+  output_port->buffer_size = output_port->buffer_size_recommended;
+
+  GST_DEBUG_OBJECT (self, "Reconfiguring output buffer pool...");
+
+  if (self->output_buffer_pool != NULL) {
+    mmal_port_pool_destroy (output_port, self->output_buffer_pool);
+  }
+
+  self->output_buffer_pool = mmal_port_pool_create (output_port,
+      output_port->buffer_num, output_port->buffer_size);
+
+  /* Recreate the decoded-frames queue. Why? Well, I get an odd assertion
+     from MMAL next time I try to retrieve a buffer from it otherwise
+     (contains NULL buffer header).
+   */
+
+  if (self->decoded_frames_queue) {
+    mmal_queue_destroy (self->decoded_frames_queue);
+    self->decoded_frames_queue = mmal_queue_create ();
+    output_port->userdata = (void *) self->decoded_frames_queue;
+  }
+
+  if (mmal_port_enable (output_port,
+          &gst_mmal_video_dec_mmal_queue_decoded_frame) != MMAL_SUCCESS) {
+
+    GST_ERROR_OBJECT (self, "Failed to enable output port!");
+    return GST_FLOW_ERROR;
+  }
+
+  GST_DEBUG_OBJECT (self, "Output port info:");
+  gst_mmal_print_port_info (output_port, GST_ELEMENT (self));
+
+  return GST_FLOW_OK;
+}
+
+
+
+/**
+ * This is called repeatedly from the src pad task.
+ * The src pad stream lock is held during the call.
+ *
+ * It's job is to populate the decoder output port with empty buffers and
+ * process output frames from the decoder.
+ */
+static void
+gst_mmal_video_dec_output_task_loop (GstMMALVideoDec * self)
+{
+  GstFlowReturn flow_ret = GST_FLOW_OK;
+
+  MMAL_BUFFER_HEADER_T *buffer = NULL;
+  GstVideoCodecFrame *frame = NULL;
+  GstClockTimeDiff deadline;
+
+  uint32_t wait_for_buffer_timeout_ms = 250;
+
+  /* We don't need to hold decoder lock for most of output reconfiguration,
+     although update_src_caps() will acquire it.
+
+     N.B. access to caps_changed is synchronised on src pad mutex, and that is
+     automatically acquired before each entry to this function.
+
+     See: gst_mmal_video_dec_set_format() for where caps_changed is set.
+   */
+  if (self->output_buffer_pool == NULL || self->caps_changed) {
+
+    /* Output structures not created yet.  To avoid some contention with input
+       side we will kick that off here on our task thread.
+     */
+    if ((flow_ret = gst_mmal_video_dec_output_reconfigure_output_port (self)) !=
+        GST_FLOW_OK) {
+
+      GST_ERROR_OBJECT (self, "Output port reconfiguration failed!");
+
+      GST_VIDEO_DECODER_STREAM_LOCK (self);
+
+      self->output_flow_ret = flow_ret;
+      gst_pad_push_event (GST_VIDEO_DECODER_SRC_PAD (self),
+          gst_event_new_eos ());
+      gst_pad_pause_task (GST_VIDEO_DECODER_SRC_PAD (self));
+      self->started = FALSE;
+
+      GST_VIDEO_DECODER_STREAM_UNLOCK (self);
+
+      return;
+    }
+
+    /* This is used below to trigger another call to update_src_caps() when we
+       receive first output frame from decoder.
+     */
+    self->output_reconfigured = TRUE;
+  }
+
+  /* Don't need to hold lock whilst populating output port. */
+
+  /* Populate output with buffers. */
+  if (!gst_mmal_video_dec_output_populate_output_port (self)) {
+
+    GST_ERROR_OBJECT (self, "Populating output port failed!");
+
+    GST_VIDEO_DECODER_STREAM_LOCK (self);
+
+    self->output_flow_ret = GST_FLOW_ERROR;
+    gst_pad_push_event (GST_VIDEO_DECODER_SRC_PAD (self), gst_event_new_eos ());
+    gst_pad_pause_task (GST_VIDEO_DECODER_SRC_PAD (self));
+    self->started = FALSE;
+
+    GST_VIDEO_DECODER_STREAM_UNLOCK (self);
+
+    return;
+  }
+
+  /* Handle decoded frames   We wait for at least one frame to be ready before
+     returning to avoid spinning.
+   */
+
+  if ((buffer = mmal_queue_timedwait (self->decoded_frames_queue,
+              wait_for_buffer_timeout_ms)) == NULL) {
+
+    /* Not an error, just nothing ready yet. */
+
+    GST_DEBUG_OBJECT (self, "Timed-out waiting for output decoded frame.");
+
+  } else {
+
+    /* We're fiddling with state of decoder baseclass, so take big lock  */
+    GST_VIDEO_DECODER_STREAM_LOCK (self);
 
     /* N.B. We never seem to see any events, so these TODO's aren't quite as bad
        as they look!
@@ -1725,15 +1888,17 @@ gst_mmal_video_dec_handle_decoded_frames (GstMMALVideoDec * self,
            framerate of "200/1" on input caps, and "progressive" when actually
            interlaced.
          */
-        if (self->caps_changed) {
+        if (self->output_reconfigured) {
 
-          if (!gst_mmal_video_dec_update_src_caps (self)) {
+          self->output_reconfigured = FALSE;
+
+          if ((flow_ret = gst_mmal_video_dec_output_update_src_caps (self)) !=
+              GST_FLOW_OK) {
             GST_ERROR_OBJECT (self, "Failed to update src caps!");
-            flow_ret = GST_FLOW_ERROR;
           }
         }
 
-        frame = gst_mmal_video_dec_find_nearest_frame (buffer,
+        frame = gst_mmal_video_dec_output_find_nearest_frame (buffer,
             gst_video_decoder_get_frames (GST_VIDEO_DECODER (self)));
 
         /* So we have a timestamped MMAL buffer and get, or not, corresponding
@@ -1746,7 +1911,7 @@ gst_mmal_video_dec_handle_decoded_frames (GstMMALVideoDec * self,
            In any cases, not likely to be seen again. so drop it before they
            pile up and use all the memory.
          */
-        gst_mmal_video_dec_clean_older_frames (self, buffer,
+        gst_mmal_video_dec_output_clean_older_frames (self, buffer,
             gst_video_decoder_get_frames (GST_VIDEO_DECODER (self)));
 
         if (frame && (deadline = gst_video_decoder_get_max_decode_time
@@ -1794,7 +1959,6 @@ gst_mmal_video_dec_handle_decoded_frames (GstMMALVideoDec * self,
                  We just need to fill-in the pointer to the MMAL header.
                */
 
-
               GstMemory *mem = gst_buffer_peek_memory (frame->output_buffer,
                   0);
 
@@ -1809,7 +1973,7 @@ gst_mmal_video_dec_handle_decoded_frames (GstMMALVideoDec * self,
             }
 
             /* Only copy frame if not using opaque. */
-            else if (!gst_mmal_video_dec_fill_buffer (self, buffer,
+            else if (!gst_mmal_video_dec_output_fill_buffer (self, buffer,
                     frame->output_buffer)) {
 
               /* FAIL */
@@ -1843,61 +2007,61 @@ gst_mmal_video_dec_handle_decoded_frames (GstMMALVideoDec * self,
     }
     /* end-else (not an event) */
 
-    /* We will always get here, so buffer should always be freed. */
-    if (buffer != NULL) {
+    if (flow_ret == GST_FLOW_EOS) {
 
-      /* Release MMAL buffer back to the output pool.
-         NOTE: We do this whether it's a "command" or an actual frame.
-       */
-      mmal_buffer_header_release (buffer);
+      g_mutex_lock (&self->drain_lock);
+
+      if (self->draining) {
+
+        /* Input side will be waiting on condvar in drain() */
+
+        GST_DEBUG_OBJECT (self, "Drained");
+        self->draining = FALSE;
+        g_cond_broadcast (&self->drain_cond);
+        flow_ret = GST_FLOW_OK;
+
+        /*
+           Pause task so we don't re-enter this loop and try output port
+           reconfiguration before input side is finished with format change, or
+           whatever it is up to.
+         */
+        gst_pad_pause_task (GST_VIDEO_DECODER_SRC_PAD (self));
+        self->started = FALSE;
+      }
+
+      g_mutex_unlock (&self->drain_lock);
     }
 
-    /* As long as all is OK, try to get next buffer.  But don't block this
-       time.
+    self->output_flow_ret = flow_ret;
+
+    if (flow_ret != GST_FLOW_OK) {
+      gst_pad_push_event (GST_VIDEO_DECODER_SRC_PAD (self),
+          gst_event_new_eos ());
+      gst_pad_pause_task (GST_VIDEO_DECODER_SRC_PAD (self));
+      self->started = FALSE;
+    }
+
+    GST_VIDEO_DECODER_STREAM_UNLOCK (self);
+  }
+  /* end-else (a decoded frame or command is ready) */
+
+  /* We will always get here, so buffer should always be freed. */
+  if (buffer != NULL) {
+
+    /* Release MMAL buffer back to the output pool.
+       NOTE: We do this whether it's a "command" or an actual frame.
      */
-    if (flow_ret == GST_FLOW_OK) {
-      buffer = mmal_queue_get (self->decoded_frames_queue);
-    }
+    mmal_buffer_header_release (buffer);
   }
-  /* end-while (more frames and everything OK) */
-
-  return flow_ret;
-}
-
-
-/**
- * This just feeds any available output buffers to the decoder output port.
- * It's called from handle_frame().
- */
-static gboolean
-gst_mmal_video_dec_populate_output_port (GstMMALVideoDec * self)
-{
-
-  MMAL_BUFFER_HEADER_T *buffer = NULL;
-
-  /* Send empty buffers to the output port of the decoder to allow the decoder
-   * to start producing frames as soon as it gets input data.
-   */
-
-  while ((buffer = mmal_queue_get (self->output_buffer_pool->queue)) != NULL) {
-
-    GST_DEBUG_OBJECT (self, "Sending empty buffer to output port...");
-
-    mmal_buffer_header_reset (buffer);
-
-    if (mmal_port_send_buffer (self->dec->output[0], buffer) != MMAL_SUCCESS) {
-      GST_ERROR_OBJECT (self, "Failed to send empty output buffer to outport!");
-      return FALSE;
-    }
-  }
-
-  return TRUE;
 }
 
 
 /**
  * N.B. This is called by the video decoder baseclass when there is some input
  * data to decode.
+ *
+ * It is responsible for feeding input frames to the decoder, and also starts
+ * the src pad (output) task when the first sync frame is encountered.
  */
 static GstFlowReturn
 gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
@@ -1914,19 +2078,15 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
 
   GstMMALVideoDec *self = GST_MMAL_VIDEO_DEC (decoder);
 
-  /* First handle any already-decoded frames. */
-  if ((flow_ret = gst_mmal_video_dec_handle_decoded_frames (self, 0)) !=
-      GST_FLOW_OK) {
-    goto done;
-  }
-
-  /* Populate output with buffers. */
-  if (!gst_mmal_video_dec_populate_output_port (self)) {
-    flow_ret = GST_FLOW_ERROR;
-    goto done;
-  }
-
   /* Handle this input frame. */
+
+  /* If there's already some error flagged by output side then give up. */
+
+  if (self->output_flow_ret != GST_FLOW_OK) {
+
+    gst_video_codec_frame_unref (frame);
+    return self->output_flow_ret;
+  }
 
   if (!self->started) {
 
@@ -1938,11 +2098,28 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
          frame.
        */
       return GST_FLOW_OK;
-    }
 
-    /* CHECKME: Is this the right thing to do? */
-    self->started = TRUE;
+    } else {
+
+      /* Output task not running yet.  Start it. */
+
+      GST_DEBUG_OBJECT (self, "Starting output task...");
+
+      gst_pad_start_task (GST_VIDEO_DECODER_SRC_PAD (self),
+          (GstTaskFunction) gst_mmal_video_dec_output_task_loop, decoder, NULL);
+
+      self->started = TRUE;
+    }
   }
+
+  /* Avoid blocking the output side whilst we are waiting for MMAL input buffer
+     headers.  Otherwise, we will not be able to process output frames whilst
+     lock is held, which will prevent the decoder from releasing input buffers
+     back to us, and we end-up in a deadlock.
+
+     We don't need to be holding the big lock for what follows.
+   */
+  GST_VIDEO_DECODER_STREAM_UNLOCK (self);
 
   input_size = gst_buffer_get_size (frame->input_buffer);
 
@@ -1987,7 +2164,7 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
     GST_DEBUG_OBJECT (self, "Waiting for input buffer...");
 
     if ((mmal_buffer = mmal_queue_timedwait (self->input_buffer_pool->queue,
-                500)) == NULL) {
+                GST_MMAL_VIDEO_DEC_INPUT_BUFFER_WAIT_FOR_MS)) == NULL) {
 
       GST_ERROR_OBJECT (self, "Failed to acquire input buffer!");
       flow_ret = GST_FLOW_ERROR;
@@ -2067,7 +2244,7 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
       /* N.B. We've taken a ref to the GstBuffer, so we need to handle that.
          Our callback function will do that for us.
        */
-      gst_mmal_video_dec_return_input_buffer_to_pool (self->dec->input[0],
+      gst_mmal_video_dec_mmal_return_input_buffer_to_pool (self->dec->input[0],
           mmal_buffer);
 
       flow_ret = GST_FLOW_ERROR;
@@ -2077,8 +2254,12 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
     previous_mapped_gst_buffer = mapped_gst_buffer;
     mmal_buffer = NULL;
   }
+  /* end-while (more to send) */
 
 done:
+
+  /* We relinquished the lock above */
+  GST_VIDEO_DECODER_STREAM_LOCK (self);
 
   /* Should reach this in all cases, except when we drop the frame. */
   gst_video_codec_frame_unref (frame);

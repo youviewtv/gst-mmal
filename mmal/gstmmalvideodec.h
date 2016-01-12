@@ -51,27 +51,45 @@ typedef struct _GstMMALVideoDecClass GstMMALVideoDecClass;
 
 struct _GstMMALVideoDec
 {
+  /* ---- SHARED STATE (INPUT & OUTPUT) ---- */
+
   GstVideoDecoder parent;
 
-  /* < protected > */
   MMAL_COMPONENT_T *dec;
 
-  /* < private > */
+  /* TRUE if the component is configured and saw the first buffer.
+     Output thread will have been started.
+   */
+  gboolean started;
+
+  GstFlowReturn output_flow_ret;
+
+  /* ---- DRAINING STATE ---- */
+
+  gboolean draining;
+  GMutex drain_lock;
+  GCond drain_cond;
+
+
+  /* ---- INPUT STATE ---- */
+
   GstVideoCodecState *input_state;
   GstBuffer *codec_data;
 
-  MMAL_QUEUE_T *decoded_frames_queue;
   MMAL_POOL_T *input_buffer_pool;
-  MMAL_POOL_T *output_buffer_pool;
 
-  /* TRUE if the component is configured and saw
-   * the first buffer */
-  gboolean started;
+  GstClockTime last_upstream_ts;
+
+
+  /* ---- OUTPUT STATE ---- */
 
   /* If the caps have just been changed. On the first output frame after a caps
      change we may need to set the src caps again.
    */
   gboolean caps_changed;
+
+  MMAL_POOL_T *output_buffer_pool;
+  MMAL_QUEUE_T *decoded_frames_queue;
 
   /* We set this on src caps change to include the interlace flags that should
      be set on subsequent output buffers.  They are then applied in
@@ -79,10 +97,10 @@ struct _GstMMALVideoDec
    */
   guint32 output_buffer_flags;
 
-  GstClockTime last_upstream_ts;
-
   /* Whether we are using MMAL opaque buffers.  Decided by allocation query. */
   gboolean opaque;
+
+  gboolean output_reconfigured;
 };
 
 struct _GstMMALVideoDecClass

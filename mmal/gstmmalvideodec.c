@@ -106,6 +106,8 @@ static gboolean gst_mmal_video_dec_stop (GstVideoDecoder * decoder);
 static gboolean gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
     GstVideoCodecState * state);
 static gboolean gst_mmal_video_dec_flush (GstVideoDecoder * decoder);
+static GstFlowReturn gst_mmal_video_dec_send_codec_data (GstMMALVideoDec * self,
+    GstBuffer * codec_data, int64_t pts_microsec, int64_t dts_microsec);
 static GstFlowReturn gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
     GstVideoCodecFrame * frame);
 
@@ -1245,28 +1247,8 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
     input_format->type = MMAL_ES_TYPE_VIDEO;
     input_format->flags = MMAL_ES_FORMAT_FLAG_FRAMED;
 
-    /* CHECKME: What to stick in here? I'm going to assume it's codec_data
-       I could be wrong about this though.  XBMC sources send codec config
-       as a separate special buffer, and that's what happens in gst-omx also
-     */
-
+    /* Codec data will be send as an extra buffer before actual frame data */
     input_format->extradata_size = 0;
-
-    if (self->codec_data != NULL) {
-
-      /* FIXME: VLC sources suggest that this needs to be reset after flush. */
-      input_format->extradata_size = gst_buffer_get_size (self->codec_data);
-
-      if (mmal_format_extradata_alloc (input_format,
-              input_format->extradata_size) != MMAL_SUCCESS) {
-
-        GST_ERROR_OBJECT (self, "Failed to allocate space for extradata!");
-        return FALSE;
-      }
-
-      gst_buffer_extract (self->codec_data, 0, input_format->extradata,
-          gst_buffer_get_size (self->codec_data));
-    }
 
     /* Derived class should set the encoding here. */
     if (klass->set_format) {
@@ -2244,6 +2226,93 @@ gst_mmal_video_dec_output_task_loop (GstMMALVideoDec * self)
 }
 
 
+static GstFlowReturn
+gst_mmal_video_dec_send_codec_data (GstMMALVideoDec * self,
+    GstBuffer * codec_data, int64_t pts_microsec, int64_t dts_microsec)
+{
+  GstFlowReturn flow_ret = GST_FLOW_OK;
+  MappedBuffer *mb = NULL;
+  MMAL_BUFFER_HEADER_T *mmal_buffer = NULL;
+  MMAL_PORT_T *input_port = NULL;
+  guint data_size;
+
+  g_return_val_if_fail (self != NULL, GST_FLOW_ERROR);
+  g_return_val_if_fail (codec_data != NULL, GST_FLOW_ERROR);
+  g_return_val_if_fail (self->dec != NULL, GST_FLOW_ERROR);
+
+  data_size = gst_buffer_get_size (codec_data);
+
+  input_port = self->dec->input[0];
+
+  GST_DEBUG_OBJECT (self, "Waiting for input buffer for codec data...");
+
+  if ((mmal_buffer = mmal_queue_timedwait (self->input_buffer_pool->queue,
+              GST_MMAL_VIDEO_DEC_INPUT_BUFFER_WAIT_FOR_MS)) == NULL) {
+
+    GST_ERROR_OBJECT (self, "Failed to acquire input buffer for codec data!");
+    flow_ret = GST_FLOW_ERROR;
+    goto done;
+  }
+
+  GST_DEBUG_OBJECT (self, "Got input MMAL buffer(%p) for codec data",
+      mmal_buffer);
+
+  /* "Resets all variables to default values" */
+  mmal_buffer_header_reset (mmal_buffer);
+  mmal_buffer->cmd = 0;
+
+  /* Use MMAL buffer payload for mapped GStreamer buffer info */
+  mb = (MappedBuffer *) mmal_buffer->data;
+
+  mb->buffer = gst_buffer_ref (codec_data);
+
+  if (!gst_buffer_map (mb->buffer, &mb->map_info, GST_MAP_READ)) {
+
+    gst_buffer_unref (mb->buffer);
+    mmal_buffer_header_release (mmal_buffer);
+
+    GST_ERROR_OBJECT (self, "Failed to map frame input buffer for reading");
+    flow_ret = GST_FLOW_ERROR;
+    goto done;
+  }
+
+  mb->next = NULL;
+  mb->previous = NULL;
+
+  mmal_buffer->data = mb->map_info.data;
+  mmal_buffer->alloc_size = input_port->buffer_size;
+  mmal_buffer->length = data_size;
+  mmal_buffer->user_data = mb;
+
+  /* Set PTS */
+  mmal_buffer->pts = pts_microsec;
+  mmal_buffer->dts = dts_microsec;
+
+  /* Flags */
+  mmal_buffer->flags |= MMAL_BUFFER_HEADER_FLAG_CONFIG;
+  mmal_buffer->flags |= MMAL_BUFFER_HEADER_FLAG_FRAME_END;
+
+  GST_DEBUG_OBJECT (self, "Sending codec data of size: %d to MMAL...",
+      data_size);
+
+  /* Now send the buffer to decoder. */
+  if (mmal_port_send_buffer (input_port, mmal_buffer) != MMAL_SUCCESS) {
+
+    GST_ERROR_OBJECT (self,
+        "Failed to send input buffer(%p) with codec data to decoder!",
+        mmal_buffer);
+
+    gst_mmal_video_dec_mmal_return_input_buffer_to_pool (input_port,
+        mmal_buffer);
+
+    flow_ret = GST_FLOW_ERROR;
+  }
+
+done:
+  return flow_ret;
+}
+
+
 /**
  * N.B. This is called by the video decoder baseclass when there is some input
  * data to decode.
@@ -2344,6 +2413,24 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
     dts_microsec = MMAL_TIME_UNKNOWN;
   }
 
+  /* First, send any extra codec data if present */
+  if (self->codec_data) {
+
+    flow_ret = gst_mmal_video_dec_send_codec_data (self, self->codec_data,
+        pts_microsec, dts_microsec);
+
+    /* empty codec_data as we have consumed it */
+    gst_buffer_replace (&self->codec_data, NULL);
+
+    /* now check error code */
+    if (flow_ret != GST_FLOW_OK) {
+      GST_ERROR_OBJECT (self, "Failed to send codec data!");
+      goto done;
+    }
+  }
+
+
+  /* Now, handle the frame */
   while (input_offset < input_size) {
 
     /* We have to wait for an input buffer.

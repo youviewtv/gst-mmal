@@ -696,7 +696,11 @@ gst_mmal_video_sink_show_frame (GstVideoSink * sink, GstBuffer * buffer)
         gst_mmal_opaque_mem_get_mmal_header (gst_buffer_peek_memory (buffer,
             0));
 
-    g_return_val_if_fail (mmal_buf != NULL, GST_FLOW_ERROR);
+    if (mmal_buf == NULL) {
+      GST_ERROR_OBJECT (self, "MMAL Buffer is NULL");
+      gst_buffer_unref (buffer);
+      return GST_FLOW_ERROR;
+    }
 
     /* NOTE: In opaque case, we take a reference to the MMAL buffer *each time
        we are asked to render it*.

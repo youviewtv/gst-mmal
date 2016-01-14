@@ -8,6 +8,7 @@ libgstmmal_la_SOURCES = \
 	gstmmalvideodec.c \
 	gstmmalvideosink.c \
 	gstmmalwmvdec.c \
+	gstmmalvp6dec.c \
 	gstmmalvp8dec.c
 
 noinst_HEADERS = \
@@ -17,6 +18,7 @@ noinst_HEADERS = \
 	gstmmalvideodec.h \
 	gstmmalvideosink.h \
 	gstmmalwmvdec.h \
+	gstmmalvp6dec.h \
 	gstmmalvp8dec.h
 
 # N.B. the `-fgnu89-inline` is there to suppress annoying "inline function

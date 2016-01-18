@@ -41,6 +41,12 @@
 
 #define MMAL_BUFFER_NUM 3
 
+/*
+ * Minimum reasonable video height and width is 1/8 of the screen size.
+ */
+#define MIN_VIDEO_WIDTH_FRACT (1.0 / 8.0)
+#define MIN_VIDEO_HEIGHT_FRACT (1.0 / 8.0)
+
 #define MAX_VIDEO_WIDTH 1920
 #define MAX_VIDEO_HEIGHT 1080
 
@@ -58,6 +64,12 @@
 
 typedef struct _GstMMALVideoSink GstMMALVideoSink;
 typedef struct _GstMMAVideoSinkClass GstMMALVideoSinkClass;
+
+typedef struct
+{
+  double x, y;
+  double width, height;
+} VideoWindow;
 
 struct _GstMMALVideoSink
 {
@@ -82,6 +94,14 @@ struct _GstMMALVideoSink
      buffers.  Decided via allocation query negotiation.
    */
   gboolean opaque;
+
+  gboolean started;
+
+  /* Dimensions of the connected screen */
+  uint32_t screen_w, screen_h;
+
+  /* Requested video window */
+  VideoWindow window;
 };
 
 struct _GstMMAVideoSinkClass
@@ -95,11 +115,23 @@ typedef struct
   GstMapInfo map_info;
 } MappedBuffer;
 
+enum
+{
+  PROP_0,
+
+  PROP_DEST_VIDEO_WINDOW_REGION,
+
+  PROP_LAST
+};
+
 GST_DEBUG_CATEGORY (mmalvideosink_debug);
 #define GST_CAT_DEFAULT mmalvideosink_debug
 
 #define gst_mmalvideosink_parent_class parent_class
+
 G_DEFINE_TYPE (GstMMALVideoSink, gst_mmal_video_sink, GST_TYPE_VIDEO_SINK);
+
+static void video_window_clamp (VideoWindow * vw);
 
 static gboolean mmal_port_supports_format_change (MMAL_PORT_T * port);
 
@@ -108,8 +140,19 @@ static void mmal_control_port_cb (MMAL_PORT_T * port,
 static void mmal_input_port_cb (MMAL_PORT_T * port,
     MMAL_BUFFER_HEADER_T * buffer);
 
+static void mmal_scale_rect (const VideoWindow * vw, MMAL_RECT_T * rect);
+
+static gboolean gst_mmal_video_sink_set_render_rectangle (GstMMALVideoSink *
+    self);
+
 static void gst_mmal_video_sink_set_format (MMAL_ES_FORMAT_T * format,
     GstVideoInfo * vinfo, gboolean opaque);
+
+
+static void gst_mmal_video_sink_get_property (GObject * object, guint prop_id,
+    GValue * value, GParamSpec * pspec);
+static void gst_mmal_video_sink_set_property (GObject * object, guint prop_id,
+    const GValue * value, GParamSpec * pspec);
 
 static gboolean gst_mmal_video_sink_set_caps (GstBaseSink * sink,
     GstCaps * caps);
@@ -139,9 +182,22 @@ static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
 static void
 gst_mmal_video_sink_class_init (GstMMALVideoSinkClass * klass)
 {
+  GObjectClass *gobject_class = G_OBJECT_CLASS (klass);
   GstElementClass *element_class = GST_ELEMENT_CLASS (klass);
   GstBaseSinkClass *basesink_class = GST_BASE_SINK_CLASS (klass);
   GstVideoSinkClass *videosink_class = GST_VIDEO_SINK_CLASS (klass);
+
+  gobject_class->set_property =
+      GST_DEBUG_FUNCPTR (gst_mmal_video_sink_set_property);
+  gobject_class->get_property =
+      GST_DEBUG_FUNCPTR (gst_mmal_video_sink_get_property);
+
+  g_object_class_install_property (gobject_class, PROP_DEST_VIDEO_WINDOW_REGION,
+      g_param_spec_boxed ("destinationwindow",
+          "Destination window",
+          "Destination video window region specified as a structure of doubles "
+          "(0.0 to 1.0): x, y, width, height",
+          GST_TYPE_STRUCTURE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   gst_element_class_add_pad_template (element_class,
       gst_static_pad_template_get (&sink_template));
@@ -161,6 +217,25 @@ gst_mmal_video_sink_class_init (GstMMALVideoSinkClass * klass)
 
   videosink_class->show_frame =
       GST_DEBUG_FUNCPTR (gst_mmal_video_sink_show_frame);
+}
+
+/**
+ * Video window set as a property may not meet our requirements:
+ *
+ *   * minimum reasonable video size is 1/8 of the screen size
+ *
+ *   * video window position should take into account minimum video size
+ *
+ * Here we clamp video window and the result will be applied and returned as
+ * a property value.
+ */
+static void
+video_window_clamp (VideoWindow * vw)
+{
+  vw->x = CLAMP (vw->x, 0.0, 1.0 - MIN_VIDEO_WIDTH_FRACT);
+  vw->y = CLAMP (vw->y, 0.0, 1.0 - MIN_VIDEO_HEIGHT_FRACT);
+  vw->width = CLAMP (vw->width, MIN_VIDEO_WIDTH_FRACT, 1.0 - vw->x);
+  vw->height = CLAMP (vw->height, MIN_VIDEO_HEIGHT_FRACT, 1.0 - vw->y);
 }
 
 static gboolean
@@ -191,6 +266,19 @@ mmal_control_port_cb (MMAL_PORT_T * port, MMAL_BUFFER_HEADER_T * buffer)
   }
 
   mmal_buffer_header_release (buffer);
+}
+
+/**
+ * Video size and position are specified as proportions of the screen size.
+ * Here we use those proportions to calculate the actual MMAL video rectangle.
+ */
+static void
+mmal_scale_rect (const VideoWindow * vw, MMAL_RECT_T * rect)
+{
+  rect->x = rect->width * vw->x;
+  rect->y = rect->height * vw->y;
+  rect->width *= vw->width;
+  rect->height *= vw->height;
 }
 
 static void
@@ -243,6 +331,79 @@ gst_mmal_video_sink_init (GstMMALVideoSink * self)
 
   self->allocator = NULL;
   self->opaque = FALSE;
+
+  self->started = FALSE;
+
+  self->screen_w = 0;
+  self->screen_h = 0;
+
+  self->window.x = 0.0;
+  self->window.y = 0.0;
+  self->window.width = 1.0;
+  self->window.height = 1.0;
+}
+
+static void
+gst_mmal_video_sink_get_property (GObject * object, guint prop_id,
+    GValue * value, GParamSpec * pspec)
+{
+  GstMMALVideoSink *self = GST_MMAL_VIDEO_SINK (object);
+
+  switch (prop_id) {
+    case PROP_DEST_VIDEO_WINDOW_REGION:
+      g_value_take_boxed (value,
+          gst_structure_new ("destinationwindow",
+              "x", G_TYPE_DOUBLE, self->window.x,
+              "y", G_TYPE_DOUBLE, self->window.y,
+              "width", G_TYPE_DOUBLE, self->window.width,
+              "height", G_TYPE_DOUBLE, self->window.height, NULL));
+      break;
+
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      break;
+  }
+}
+
+static void
+gst_mmal_video_sink_set_property (GObject * object, guint prop_id,
+    const GValue * value, GParamSpec * pspec)
+{
+  GstMMALVideoSink *self = GST_MMAL_VIDEO_SINK (object);
+
+  switch (prop_id) {
+    case PROP_DEST_VIDEO_WINDOW_REGION:
+    {
+      VideoWindow vw;
+
+      if (gst_structure_get (g_value_get_boxed (value),
+              "x", G_TYPE_DOUBLE, &vw.x,
+              "y", G_TYPE_DOUBLE, &vw.y,
+              "width", G_TYPE_DOUBLE, &vw.width,
+              "height", G_TYPE_DOUBLE, &vw.height, NULL)) {
+
+        video_window_clamp (&vw);
+        self->window = vw;
+
+        /*
+         * Set the video window only when started (requires initialising BCM and
+         * querying screen size).  If not started, video window size change is
+         * postponed to when the sink is actually started.
+         */
+        if (self->started && !gst_mmal_video_sink_set_render_rectangle (self)) {
+          GST_ERROR_OBJECT (self, "Failed to set render rectangle");
+        }
+      } else {
+        GST_WARNING_OBJECT (object, "Invalid destination window");
+      }
+
+      break;
+    }
+
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      break;
+  }
 }
 
 static void
@@ -392,17 +553,35 @@ gst_mmal_video_sink_start (GstBaseSink * sink)
 
   display_region.hdr.id = MMAL_PARAMETER_DISPLAYREGION;
   display_region.hdr.size = sizeof (MMAL_DISPLAYREGION_T);
-  display_region.fullscreen = MMAL_TRUE;
-  display_region.mode = MMAL_DISPLAY_MODE_FILL;
-  display_region.set = MMAL_DISPLAY_SET_FULLSCREEN | MMAL_DISPLAY_SET_MODE;
-  status = mmal_port_parameter_set (input, &display_region.hdr);
+
+  status = mmal_port_parameter_get (input, &display_region.hdr);
   if (status != MMAL_SUCCESS) {
-    GST_ERROR_OBJECT (self, "Failed to set display region: %s (%u)",
+    GST_ERROR_OBJECT (self, "Failed to get display region: %s (%u)",
         mmal_status_to_string (status), status);
     return FALSE;
   }
 
+  if ((display_region.set & MMAL_DISPLAY_SET_NUM) == 0) {
+    GST_ERROR_OBJECT (self, "Failed to get display identifier");
+    return FALSE;
+  }
+
+  /* TODO:  This should be checked every time screen size is changed */
+  if (graphics_get_display_size (display_region.display_num,
+          &self->screen_w, &self->screen_h) < 0) {
+    GST_ERROR_OBJECT (self, "Failed to get display dimensions");
+    return FALSE;
+  }
+
   self->allocator = g_object_new (gst_mmal_opaque_allocator_get_type (), NULL);
+
+  self->started = TRUE;
+
+  /* TODO:  This should be called every time screen size is updated */
+  if (!gst_mmal_video_sink_set_render_rectangle (self)) {
+    GST_ERROR_OBJECT (self, "Failed to set render rectangle");
+    return FALSE;
+  }
 
   return TRUE;
 }
@@ -416,6 +595,8 @@ gst_mmal_video_sink_stop (GstBaseSink * sink)
 
   self = GST_MMAL_VIDEO_SINK (sink);
   GST_DEBUG_OBJECT (self, "stop");
+
+  self->started = FALSE;
 
   gst_mmal_video_sink_disable_renderer (self);
 
@@ -760,6 +941,53 @@ gst_mmal_video_sink_enable_renderer (GstMMALVideoSink * self)
         return FALSE;
       }
     }
+  }
+
+  return TRUE;
+}
+
+/**
+ * Use obtained screen size and video window size to apply MMAL video rectangle
+ * configuration every time either screen size or video window is changed.
+ */
+static gboolean
+gst_mmal_video_sink_set_render_rectangle (GstMMALVideoSink * self)
+{
+  MMAL_DISPLAYREGION_T display_region;
+  MMAL_STATUS_T status;
+
+  g_return_val_if_fail (self != NULL, FALSE);
+  g_return_val_if_fail (self->started, FALSE);
+
+  GST_DEBUG_OBJECT (self, "video window: x=%f y=%f w=%f h=%f",
+      self->window.x, self->window.y, self->window.width, self->window.height);
+
+  display_region.hdr.id = MMAL_PARAMETER_DISPLAYREGION;
+  display_region.hdr.size = sizeof (MMAL_DISPLAYREGION_T);
+
+  display_region.fullscreen = MMAL_FALSE;
+  display_region.mode = MMAL_DISPLAY_MODE_FILL;
+
+  display_region.dest_rect.x = 0;
+  display_region.dest_rect.y = 0;
+  display_region.dest_rect.width = self->screen_w;
+  display_region.dest_rect.height = self->screen_h;
+
+  mmal_scale_rect (&self->window, &display_region.dest_rect);
+  GST_DEBUG_OBJECT (self, "render rectangle: x=%d y=%d w=%d h=%d",
+      display_region.dest_rect.x, display_region.dest_rect.y,
+      display_region.dest_rect.width, display_region.dest_rect.height);
+
+  display_region.set =
+      MMAL_DISPLAY_SET_FULLSCREEN | MMAL_DISPLAY_SET_MODE |
+      MMAL_DISPLAY_SET_DEST_RECT;
+
+  status =
+      mmal_port_parameter_set (self->renderer->input[0], &display_region.hdr);
+  if (status != MMAL_SUCCESS) {
+    GST_ERROR_OBJECT (self, "Failed to set display region: %s (%u)",
+        mmal_status_to_string (status), status);
+    return FALSE;
   }
 
   return TRUE;

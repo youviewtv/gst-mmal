@@ -99,10 +99,6 @@ gst_video_decoder_finish_frame, or call gst_video_decoder_drop_frame.
 
 static void gst_mmal_video_dec_finalize (GObject * object);
 
-static GstStateChangeReturn
-gst_mmal_video_dec_change_state (GstElement * element,
-    GstStateChange transition);
-
 static gboolean gst_mmal_video_dec_open (GstVideoDecoder * decoder);
 static gboolean gst_mmal_video_dec_close (GstVideoDecoder * decoder);
 static gboolean gst_mmal_video_dec_start (GstVideoDecoder * decoder);
@@ -161,9 +157,6 @@ gst_mmal_video_dec_class_init (GstMMALVideoDecClass * klass)
 
   gobject_class->finalize = gst_mmal_video_dec_finalize;
 
-  element_class->change_state =
-      GST_DEBUG_FUNCPTR (gst_mmal_video_dec_change_state);
-
   video_decoder_class->open = GST_DEBUG_FUNCPTR (gst_mmal_video_dec_open);
   video_decoder_class->close = GST_DEBUG_FUNCPTR (gst_mmal_video_dec_close);
   video_decoder_class->start = GST_DEBUG_FUNCPTR (gst_mmal_video_dec_start);
@@ -190,6 +183,7 @@ gst_mmal_video_dec_class_init (GstMMALVideoDecClass * klass)
   gst_element_class_add_pad_template (element_class, pad_template);
 
 }
+
 
 static void
 gst_mmal_video_dec_init (GstMMALVideoDec * self)
@@ -219,7 +213,10 @@ gst_mmal_video_dec_init (GstMMALVideoDec * self)
 
 
 /**
- * This is called on MMAL thread.
+ * This is called on MMAL thread when the control port has something to tell us.
+ *
+ * We just log the messages at the moment as the only useful thing we are
+ * getting on this callback is error notifications.
  */
 static void
 gst_mmal_video_dec_control_port_callback (MMAL_PORT_T * port,
@@ -245,6 +242,11 @@ gst_mmal_video_dec_control_port_callback (MMAL_PORT_T * port,
 }
 
 
+/**
+ * Called by GstVideoDecoder baseclass on transition NULL->READY
+ *
+ * Should allocate "non-stream-specific" resources.
+ */
 static gboolean
 gst_mmal_video_dec_open (GstVideoDecoder * decoder)
 {
@@ -254,15 +256,12 @@ gst_mmal_video_dec_open (GstVideoDecoder * decoder)
 
   bcm_host_init ();
 
-  // Create the video decoder component on VideoCore
+  /* Create the video decoder component on VideoCore */
   if (mmal_component_create (MMAL_COMPONENT_DEFAULT_VIDEO_DECODER, &self->dec)
       != MMAL_SUCCESS) {
     GST_ERROR_OBJECT (self, "Failed to create MMAL decoder component.");
     return FALSE;
   }
-
-  self->decoded_frames_queue = mmal_queue_create ();
-  self->dec->output[0]->userdata = (void *) self->decoded_frames_queue;
 
   self->dec->control->userdata = (void *) self;
 
@@ -280,6 +279,12 @@ gst_mmal_video_dec_open (GstVideoDecoder * decoder)
   return TRUE;
 }
 
+
+/**
+ * Called by GstVideoDecoder baseclass on transition READY->NULL
+ *
+ * Should free "non-stream-specific" resources.
+ */
 static gboolean
 gst_mmal_video_dec_close (GstVideoDecoder * decoder)
 {
@@ -287,23 +292,23 @@ gst_mmal_video_dec_close (GstVideoDecoder * decoder)
 
   GST_DEBUG_OBJECT (self, "Closing decoder");
 
+  if (self->dec->control->is_enabled
+      && mmal_port_disable (self->dec->control) != MMAL_SUCCESS) {
+    /* Log the error, but there's not much we can do at this point. */
+    GST_ERROR_OBJECT (self, "Failed to disable decoder control port!");
+  }
+
   mmal_component_destroy (self->dec);
-  mmal_queue_destroy (self->decoded_frames_queue);
 
   bcm_host_deinit ();
 
   self->dec = NULL;
-  self->decoded_frames_queue = NULL;
-  self->input_buffer_pool = NULL;
-  self->output_buffer_pool = NULL;
-  self->last_upstream_ts = 0;
-
-  self->started = FALSE;
 
   GST_DEBUG_OBJECT (self, "Closed decoder");
 
   return TRUE;
 }
+
 
 static void
 gst_mmal_video_dec_finalize (GObject * object)
@@ -316,84 +321,67 @@ gst_mmal_video_dec_finalize (GObject * object)
   G_OBJECT_CLASS (gst_mmal_video_dec_parent_class)->finalize (object);
 }
 
-static GstStateChangeReturn
-gst_mmal_video_dec_change_state (GstElement * element,
-    GstStateChange transition)
-{
-  GstMMALVideoDec *self;
-  GstStateChangeReturn ret = GST_STATE_CHANGE_SUCCESS;
 
-  g_return_val_if_fail (GST_IS_MMAL_VIDEO_DEC (element),
-      GST_STATE_CHANGE_FAILURE);
-  self = GST_MMAL_VIDEO_DEC (element);
-
-  switch (transition) {
-    case GST_STATE_CHANGE_NULL_TO_READY:
-      break;
-    case GST_STATE_CHANGE_READY_TO_PAUSED:
-      break;
-    case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
-      break;
-    case GST_STATE_CHANGE_PAUSED_TO_READY:
-      break;
-    default:
-      break;
-  }
-
-  if (ret == GST_STATE_CHANGE_FAILURE)
-    return ret;
-
-  /* Delegate to baseclass impl */
-  ret =
-      GST_ELEMENT_CLASS (gst_mmal_video_dec_parent_class)->change_state
-      (element, transition);
-
-  if (ret == GST_STATE_CHANGE_FAILURE)
-    return ret;
-
-  switch (transition) {
-    case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
-      break;
-    case GST_STATE_CHANGE_PAUSED_TO_READY:
-      self->started = FALSE;
-      // TODO: MMAL shutdown without close?
-//      if (!gst_omx_video_dec_shutdown (self))
-//        ret = GST_STATE_CHANGE_FAILURE;
-      break;
-    case GST_STATE_CHANGE_READY_TO_NULL:
-      break;
-    default:
-      break;
-  }
-
-  return ret;
-}
-
+/**
+ * Called by GstVideoDecoder baseclass on transition from READY->PAUSED
+ *
+ * We can acquire stream-specific resources.
+ *
+ * We don't start output task until we see first input frame in:
+ * gst_mmal_video_dec_handle_frame()
+ */
 static gboolean
 gst_mmal_video_dec_start (GstVideoDecoder * decoder)
 {
   GstMMALVideoDec *self = GST_MMAL_VIDEO_DEC (decoder);
 
+  GST_DEBUG_OBJECT (self, "Start");
+
   self->last_upstream_ts = 0;
 
   self->output_flow_ret = GST_FLOW_OK;
+  g_mutex_lock (&self->drain_lock);
+  self->draining = FALSE;
+  g_mutex_unlock (&self->drain_lock);
+
+  GST_PAD_STREAM_LOCK (GST_VIDEO_DECODER_SRC_PAD (self));
+
+  /* N.B. This is actually set in handle_frame() */
+  self->started = FALSE;
+
+  self->caps_changed = FALSE;
+  self->output_reconfigured = FALSE;
+  self->output_buffer_flags = 0;
+
+  self->decoded_frames_queue = mmal_queue_create ();
+  self->dec->output[0]->userdata = (void *) self->decoded_frames_queue;
+
+  GST_PAD_STREAM_UNLOCK (GST_VIDEO_DECODER_SRC_PAD (self));
 
   return TRUE;
 }
 
+
+/**
+ * Called by GstVideoDecoder baseclass on transition from PAUSED->READY.
+ *
+ * We should free stream-specific resources.
+ */
 static gboolean
 gst_mmal_video_dec_stop (GstVideoDecoder * decoder)
 {
+  gboolean success = TRUE;
+
   GstMMALVideoDec *self;
 
   self = GST_MMAL_VIDEO_DEC (decoder);
 
   GST_DEBUG_OBJECT (self, "Stopping decoder");
 
-  gst_pad_stop_task (GST_VIDEO_DECODER_SRC_PAD (decoder));
+  /* Full flush will stop the output side. */
+  gst_mmal_video_dec_flush (decoder);
 
   self->output_flow_ret = GST_FLOW_FLUSHING;
-  self->started = FALSE;
 
   g_mutex_lock (&self->drain_lock);
   self->draining = FALSE;
@@ -407,11 +395,54 @@ gst_mmal_video_dec_stop (GstVideoDecoder * decoder)
     self->input_state = NULL;
   }
 
+  GST_DEBUG_OBJECT (self, "Disabling input port");
+
+  /* Disable ports and free-up buffer pools. */
+  if (self->dec->input[0]->is_enabled &&
+      mmal_port_disable (self->dec->input[0]) != MMAL_SUCCESS) {
+
+    GST_ERROR_OBJECT (self, "Failed to disable input port!");
+    success = FALSE;
+  }
+
+  GST_DEBUG_OBJECT (self, "Freeing input buffer pool");
+
+  if (self->input_buffer_pool != NULL) {
+    mmal_pool_destroy (self->input_buffer_pool);
+    self->input_buffer_pool = NULL;
+  }
+
+  GST_PAD_STREAM_LOCK (GST_VIDEO_DECODER_SRC_PAD (self));
+
+  GST_DEBUG_OBJECT (self, "Freeing decoded frames queue");
+
+  if (self->decoded_frames_queue) {
+    mmal_queue_destroy (self->decoded_frames_queue);
+    self->decoded_frames_queue = NULL;
+  }
+
+  GST_DEBUG_OBJECT (self, "Disabling output port");
+
+  if (self->dec->output[0]->is_enabled &&
+      mmal_port_disable (self->dec->output[0]) != MMAL_SUCCESS) {
+
+    GST_ERROR_OBJECT (self, "Failed to disable output port!");
+    success = FALSE;
+  }
+
+  GST_DEBUG_OBJECT (self, "Freeing output buffer pool");
+
+  if (self->output_buffer_pool != NULL) {
+    mmal_port_pool_destroy (self->dec->output[0], self->output_buffer_pool);
+    self->output_buffer_pool = NULL;
+  }
+
+  GST_PAD_STREAM_UNLOCK (GST_VIDEO_DECODER_SRC_PAD (self));
+
   GST_DEBUG_OBJECT (self, "Stopped decoder");
 
-  return TRUE;
+  return success;
 }
-
 
 
 /**
@@ -493,7 +524,6 @@ gst_mmal_video_dec_mmal_queue_decoded_frame (MMAL_PORT_T * port,
 }
 
 
-
 /**
  * Bare-bones mapping of supported color formats to GST.  Right now, we will
  * only support I420.
@@ -557,6 +587,7 @@ gst_mmal_es_type_to_string (MMAL_ES_TYPE_T type)
       return "Unknown";
   }
 }
+
 
 /**
  * This function prints video format of given port.
@@ -1110,7 +1141,7 @@ gst_mmal_video_dec_finish (GstVideoDecoder * decoder)
 
 /**
  * This is called by the GstVideoDecoder baseclass to let us know the input
- * format has changed.
+ * format has changed (i.e. when set_caps() is called on base).
  *
  * This will be called *with* decoder stream lock held.
  *
@@ -1895,7 +1926,6 @@ gst_mmal_video_dec_output_reconfigure_output_port (GstMMALVideoDec * self)
 
   return GST_FLOW_OK;
 }
-
 
 
 /**

@@ -1784,15 +1784,19 @@ gst_mmal_video_dec_output_populate_output_port (GstMMALVideoDec * self)
      to start producing frames as soon as it gets input data.
    */
 
-  while ((buffer = mmal_queue_get (self->output_buffer_pool->queue)) != NULL) {
+  if (self->output_buffer_pool != NULL) {
 
-    GST_DEBUG_OBJECT (self, "Sending empty buffer to output port...");
+    while ((buffer = mmal_queue_get (self->output_buffer_pool->queue)) != NULL) {
 
-    mmal_buffer_header_reset (buffer);
+      GST_DEBUG_OBJECT (self, "Sending empty buffer to output port...");
 
-    if (mmal_port_send_buffer (self->dec->output[0], buffer) != MMAL_SUCCESS) {
-      GST_ERROR_OBJECT (self, "Failed to send empty output buffer to outport!");
-      return FALSE;
+      mmal_buffer_header_reset (buffer);
+
+      if (mmal_port_send_buffer (self->dec->output[0], buffer) != MMAL_SUCCESS) {
+        GST_ERROR_OBJECT (self,
+            "Failed to send empty output buffer to outport!");
+        return FALSE;
+      }
     }
   }
 

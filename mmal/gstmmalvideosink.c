@@ -168,7 +168,7 @@ static GstFlowReturn gst_mmal_video_sink_show_frame (GstVideoSink * videosink,
 
 static gboolean gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self);
 static gboolean gst_mmal_video_sink_configure_renderer (GstMMALVideoSink *
-    self);
+    self, gboolean opaque);
 static void gst_mmal_video_sink_disable_renderer (GstMMALVideoSink * self);
 static gboolean gst_mmal_video_sink_enable_renderer (GstMMALVideoSink * self);
 
@@ -450,8 +450,11 @@ gst_mmal_video_sink_propose_allocation (GstBaseSink * sink, GstQuery * query)
     GST_DEBUG_OBJECT (self, "Opaque MMAL buffers requested.");
 
     if (self->allocator) {
+      GST_DEBUG_OBJECT (self, "Adding opaque allocator...");
       gst_query_add_allocation_param (query, GST_ALLOCATOR (self->allocator),
           NULL);
+    } else {
+      GST_ERROR_OBJECT (self, "Opaque allocator is NULL!");
     }
   }
 
@@ -465,6 +468,8 @@ gst_mmal_video_sink_set_caps (GstBaseSink * sink, GstCaps * caps)
   GstMMALVideoSink *self = NULL;
   GstVideoInfo vinfo;
   GstVideoAlignment align;
+  GstCapsFeatures *features;
+  gboolean opaque_caps;
 
   g_return_val_if_fail (sink != NULL, FALSE);
 
@@ -476,7 +481,27 @@ gst_mmal_video_sink_set_caps (GstBaseSink * sink, GstCaps * caps)
     return FALSE;
   }
 
-  if (gst_video_info_is_equal (&vinfo, &self->vinfo)) {
+  /* N.B. Just for extra fun, we can see a change between opaque and plain
+     buffers in some cases.  We won't know for sure if opaque buffers are in
+     use until we see the first frame, but we have to assume a change if buffer
+     type changes.  Comparison of video info alone will not tell us that, so
+     check caps features.
+   */
+  features = gst_caps_get_features (caps, 0);
+
+  opaque_caps = (features != NULL
+      && gst_caps_features_contains (features,
+          GST_CAPS_FEATURE_MEMORY_MMAL_OPAQUE));
+
+  if (opaque_caps != self->opaque) {
+    GST_DEBUG_OBJECT (self, "Caps indicate a change of buffer type. "
+        "Was %s, now %s", (self->opaque ? "Opaque" : "Plain"),
+        (opaque_caps ? "Opaque" : "Plain"));
+  }
+
+  if (opaque_caps == self->opaque && gst_video_info_is_equal (&vinfo,
+          &self->vinfo)) {
+    GST_DEBUG_OBJECT (self, "Format is unchanged.  No reconfigure needed.");
     return TRUE;
   }
 
@@ -510,6 +535,7 @@ gst_mmal_video_sink_set_caps (GstBaseSink * sink, GstCaps * caps)
   /* Next time we see an input buffer, we need to configure port.
      We need to wait for this in order to see if we're opaque or not.
    */
+  GST_DEBUG_OBJECT (self, "Format changed.  Need reconfigure on next frame.");
   self->need_reconfigure = TRUE;
 
   return TRUE;
@@ -677,14 +703,18 @@ gst_mmal_video_sink_show_frame (GstVideoSink * sink, GstBuffer * buffer)
   if (self->need_reconfigure) {
 
     /* Work out from buffer whether opaque buffers were negotiated. */
+    {
+      gboolean opaque =
+          gst_is_mmal_opaque_memory (gst_buffer_peek_memory (buffer, 0));
 
-    self->opaque = gst_is_mmal_opaque_memory (gst_buffer_peek_memory (buffer,
-            0));
+      /* N.B. configure_renderer() cares if we're switching buffer type:
+         plain <-> opaque.  It will set new self->opaque value.
+       */
+      if (!gst_mmal_video_sink_configure_renderer (self, opaque)) {
 
-    if (!gst_mmal_video_sink_configure_renderer (self)) {
-
-      GST_ERROR_OBJECT (self, "Reconfigure failed!");
-      return GST_FLOW_ERROR;
+        GST_ERROR_OBJECT (self, "Reconfigure failed!");
+        return GST_FLOW_ERROR;
+      }
     }
   }
 
@@ -793,9 +823,6 @@ gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self)
 
   g_return_val_if_fail (self != NULL, FALSE);
 
-  /* This function should not be called in opaque mode. */
-  g_return_val_if_fail (!self->opaque, FALSE);
-
   vinfo = &self->vinfo;
 
   g_return_val_if_fail (self->renderer != NULL, FALSE);
@@ -803,6 +830,21 @@ gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self)
 
   input = self->renderer->input[0];
   g_return_val_if_fail (input != NULL, FALSE);
+
+  /* In opaque case we don't need any pool, but it's possible that we're
+     switching from opaque to plain buffers, in which case we should destroy
+     any existing pool.
+   */
+  if (self->opaque) {
+    if (self->pool != NULL) {
+      GST_DEBUG_OBJECT (self, "Switching to opaque buffers, destroying pool");
+      mmal_port_pool_destroy (input, self->pool);
+      self->pool = NULL;
+    }
+    return TRUE;
+  }
+
+  /* Rest is for plain buffers. */
 
   input->buffer_num = MMAL_BUFFER_NUM;
   input->buffer_size = MAX_I420_BUFFER_SIZE;
@@ -818,6 +860,7 @@ gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self)
   }
 
   if (self->pool == NULL) {
+    GST_DEBUG_OBJECT (self, "Creating input pool...");
     self->pool = mmal_port_pool_create (input, MMAL_BUFFER_NUM,
         MAX_I420_BUFFER_SIZE);
   }
@@ -836,7 +879,8 @@ gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self)
 }
 
 static gboolean
-gst_mmal_video_sink_configure_renderer (GstMMALVideoSink * self)
+gst_mmal_video_sink_configure_renderer (GstMMALVideoSink * self,
+    gboolean opaque)
 {
   MMAL_PORT_T *input = NULL;
   MMAL_STATUS_T status;
@@ -849,20 +893,45 @@ gst_mmal_video_sink_configure_renderer (GstMMALVideoSink * self)
   input = self->renderer->input[0];
   g_return_val_if_fail (input != NULL, FALSE);
 
+  /* We would like to avoid disabling port if at all possible.  This is
+     particularly important when playing adaptive streams so we can achieve
+     smooth representation changes.  However, if pipeline is doing
+     something funky to change buffer type after initial negotiation, this
+     requires disable & flush.
+   */
   if (!mmal_port_supports_format_change (input)) {
+
     gst_mmal_video_sink_disable_renderer (self);
+
+  } else if (opaque != self->opaque) {
+
+    GST_DEBUG_OBJECT (self, "Changing buffer type, we have to disable port.");
+
+    if (self->renderer->input[0]->is_enabled) {
+      mmal_port_disable (self->renderer->input[0]);
+      mmal_port_flush (self->renderer->input[0]);
+    }
   }
 
-  gst_mmal_video_sink_set_format (input->format, &self->vinfo, self->opaque);
+  self->opaque = opaque;
+
+  GST_DEBUG_OBJECT (self, "Setting format. Opaque? %s",
+      (self->opaque ? "yes" : "no"));
+
+  gst_mmal_video_sink_set_format (input->format, &self->vinfo, opaque);
 
   status = mmal_port_format_commit (input);
+
   if (status != MMAL_SUCCESS) {
     GST_ERROR_OBJECT (self, "Failed to commit input format: %s (%u)",
         mmal_status_to_string (status), status);
     return FALSE;
   }
 
-  configured = (self->opaque || gst_mmal_video_sink_configure_pool (self)) &&
+  /* N.B. we don't need a pool for opaque, but we should destroy existing one
+     if we have it.
+   */
+  configured = gst_mmal_video_sink_configure_pool (self) &&
       gst_mmal_video_sink_enable_renderer (self);
 
   self->need_reconfigure = !configured;

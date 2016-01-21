@@ -1685,16 +1685,12 @@ gst_mmal_video_dec_output_fill_buffer (GstMMALVideoDec * self,
    */
   if (gst_buffer_get_size (outbuf) == inbuf->length) {
 
-    GstMapInfo map = GST_MAP_INFO_INIT;
+    if (gst_buffer_fill (outbuf, 0,
+            inbuf->data + inbuf->offset, inbuf->length) != inbuf->length) {
 
-    if (!gst_buffer_map (outbuf, &map, GST_MAP_WRITE)) {
-      GST_ERROR_OBJECT (self, "Failed to map output buffer");
+      GST_ERROR_OBJECT (self, "Failed to fill output buffer");
       goto done;
     }
-
-    memcpy (map.data, inbuf->data + inbuf->offset, inbuf->length);
-
-    gst_buffer_unmap (outbuf, &map);
 
     ret = TRUE;
     goto done;

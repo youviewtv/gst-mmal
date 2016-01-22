@@ -297,6 +297,13 @@ gst_mmal_video_dec_close (GstVideoDecoder * decoder)
     GST_ERROR_OBJECT (self, "Failed to disable decoder control port!");
   }
 
+  if (self->dec->is_enabled && mmal_component_disable (self->dec) !=
+      MMAL_SUCCESS) {
+
+    GST_ERROR_OBJECT (self, "Failed to disable decoder component!");
+    return FALSE;
+  }
+
   mmal_component_destroy (self->dec);
 
   bcm_host_deinit ();

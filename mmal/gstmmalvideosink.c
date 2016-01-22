@@ -839,6 +839,9 @@ gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self)
   input = self->renderer->input[0];
   g_return_val_if_fail (input != NULL, FALSE);
 
+  GST_DEBUG_OBJECT (self, "buffers recommended: %u",
+      input->buffer_num_recommended);
+
   input->buffer_num = self->opaque ?
       GST_MMAL_NUM_OUTPUT_BUFFERS_OPAQUE_MODE : MMAL_BUFFER_NUM;
   input->buffer_size = MAX_I420_BUFFER_SIZE;

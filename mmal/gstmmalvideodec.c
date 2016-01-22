@@ -1130,6 +1130,9 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
       return FALSE;
     }
 
+    GST_DEBUG_OBJECT (self, "buffers recommended (in): %u",
+        input_port->buffer_num_recommended);
+
     input_port->buffer_num = input_port->buffer_num_recommended;
     input_port->buffer_size = input_port->buffer_size_recommended;
 
@@ -1711,6 +1714,9 @@ gst_mmal_video_dec_output_reconfigure_output_port (GstMMALVideoDec * self,
   }
 
   output_format = output_port->format;
+
+  GST_DEBUG_OBJECT (self, "buffers recommended (out): %u",
+      output_port->buffer_num_recommended);
 
   if (self->opaque) {
 

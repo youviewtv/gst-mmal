@@ -1951,6 +1951,9 @@ gst_mmal_deinterlace_setup_image_fx (GstMMALDeinterlace * self)
     return FALSE;
   }
 
+  GST_DEBUG_OBJECT (self, "buffers recommended (in): %u",
+      input_port->buffer_num_recommended);
+
   input_port->buffer_num = GST_MMAL_NUM_OUTPUT_BUFFERS_OPAQUE_MODE;
   input_port->buffer_size = input_port->buffer_size_recommended;
 
@@ -1990,6 +1993,9 @@ gst_mmal_deinterlace_setup_image_fx (GstMMALDeinterlace * self)
   }
 
   mmal_format_full_copy (output_format, input_format);
+
+  GST_DEBUG_OBJECT (self, "buffers recommended (out): %u",
+      output_port->buffer_num_recommended);
 
   output_port->buffer_num = GST_MMAL_NUM_OUTPUT_BUFFERS_OPAQUE_MODE;
   output_port->buffer_size = input_port->buffer_size;

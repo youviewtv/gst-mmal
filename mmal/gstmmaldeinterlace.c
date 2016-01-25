@@ -1946,6 +1946,13 @@ gst_mmal_deinterlace_setup_image_fx (GstMMALDeinterlace * self)
   /* image_fx supports opaque buffers only */
   input_format->encoding = MMAL_ENCODING_OPAQUE;
 
+  if (mmal_port_parameter_set_boolean (input_port, MMAL_PARAMETER_ZERO_COPY,
+          MMAL_TRUE) != MMAL_SUCCESS) {
+
+    GST_ERROR_OBJECT (self, "Failed to set/unset zero-copy on input port!");
+    return FALSE;
+  }
+
   if (mmal_port_format_commit (input_port) != MMAL_SUCCESS) {
     GST_ERROR_OBJECT (self, "Failed to commit new input port format!");
     return FALSE;
@@ -1999,6 +2006,13 @@ gst_mmal_deinterlace_setup_image_fx (GstMMALDeinterlace * self)
 
   output_port->buffer_num = GST_MMAL_NUM_OUTPUT_BUFFERS_OPAQUE_MODE;
   output_port->buffer_size = input_port->buffer_size;
+
+  if (mmal_port_parameter_set_boolean (output_port, MMAL_PARAMETER_ZERO_COPY,
+          MMAL_TRUE) != MMAL_SUCCESS) {
+
+    GST_ERROR_OBJECT (self, "Failed to set/unset zero-copy on output port!");
+    goto error_output_locked;
+  }
 
   if (mmal_port_format_commit (output_port) != MMAL_SUCCESS) {
     GST_ERROR_OBJECT (self, "Failed to commit new output port format!");

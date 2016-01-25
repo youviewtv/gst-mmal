@@ -932,6 +932,13 @@ gst_mmal_video_sink_configure_renderer (GstMMALVideoSink * self,
 
   gst_mmal_video_sink_set_format (input->format, &self->vinfo, opaque);
 
+  if (mmal_port_parameter_set_boolean (input, MMAL_PARAMETER_ZERO_COPY, opaque)
+      != MMAL_SUCCESS) {
+
+    GST_ERROR_OBJECT (self, "Failed to set/unset zero-copy on input port!");
+    return FALSE;
+  }
+
   status = mmal_port_format_commit (input);
 
   if (status != MMAL_SUCCESS) {

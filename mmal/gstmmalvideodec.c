@@ -1720,6 +1720,13 @@ gst_mmal_video_dec_output_reconfigure_output_port (GstMMALVideoDec * self,
   GST_DEBUG_OBJECT (self, "buffers recommended (out): %u",
       output_port->buffer_num_recommended);
 
+  if (mmal_port_parameter_set_boolean (output_port, MMAL_PARAMETER_ZERO_COPY,
+          self->opaque) != MMAL_SUCCESS) {
+
+    GST_ERROR_OBJECT (self, "Failed to set/unset zero-copy on output port!");
+    return GST_FLOW_ERROR;
+  }
+
   if (self->opaque) {
 
     GST_DEBUG_OBJECT (self, "Configuring opaque buffers on output port...");

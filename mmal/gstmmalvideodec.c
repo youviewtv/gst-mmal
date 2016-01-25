@@ -420,13 +420,6 @@ gst_mmal_video_dec_stop (GstVideoDecoder * decoder)
 
   GST_PAD_STREAM_LOCK (GST_VIDEO_DECODER_SRC_PAD (self));
 
-  GST_DEBUG_OBJECT (self, "Freeing decoded frames queue");
-
-  if (self->decoded_frames_queue) {
-    mmal_queue_destroy (self->decoded_frames_queue);
-    self->decoded_frames_queue = NULL;
-  }
-
   GST_DEBUG_OBJECT (self, "Disabling output port");
 
   if (self->dec->output[0]->is_enabled &&
@@ -434,6 +427,13 @@ gst_mmal_video_dec_stop (GstVideoDecoder * decoder)
 
     GST_ERROR_OBJECT (self, "Failed to disable output port!");
     success = FALSE;
+  }
+
+  GST_DEBUG_OBJECT (self, "Freeing decoded frames queue");
+
+  if (self->decoded_frames_queue) {
+    mmal_queue_destroy (self->decoded_frames_queue);
+    self->decoded_frames_queue = NULL;
   }
 
   GST_DEBUG_OBJECT (self, "Freeing output buffer pool");

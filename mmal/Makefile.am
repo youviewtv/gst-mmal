@@ -1,6 +1,7 @@
 plugin_LTLIBRARIES = libgstmmal.la
 
 libgstmmal_la_SOURCES = \
+	../ext/mmal/mmal_buffer_workaround.c \
 	gstmmal.c \
 	gstmmalmemory.c \
 	gstmmalh264dec.c \

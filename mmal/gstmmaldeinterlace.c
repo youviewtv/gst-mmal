@@ -885,10 +885,11 @@ gst_mmal_deinterlace_chain (GstPad * pad, GstObject * object, GstBuffer * buf)
     goto done;
   }
 
-  GST_MMAL_DEINTERLACE_STREAM_UNLOCK (self);
-
   /* Progressive (non-interlaced) frames shall be passed directly to output */
   if (self->interlace_type == MMAL_InterlaceProgressive) {
+
+    GST_MMAL_DEINTERLACE_STREAM_UNLOCK (self);
+
     GST_DEBUG_OBJECT (self,
         "Progressive frame.  Pushing directly to output pad (PTS=%lld)",
         GST_BUFFER_PTS (buf));
@@ -902,8 +903,6 @@ gst_mmal_deinterlace_chain (GstPad * pad, GstObject * object, GstBuffer * buf)
     flow_ret = gst_pad_push (self->src_pad, buf);
     goto done_unlocked;
   }
-
-  GST_MMAL_DEINTERLACE_STREAM_LOCK (self);
 
   if (self->need_reconfigure && !gst_mmal_deinterlace_configure (self)) {
     GST_ERROR_OBJECT (self, "Reconfigure failed!");

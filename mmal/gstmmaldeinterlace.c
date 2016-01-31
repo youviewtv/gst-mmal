@@ -1080,12 +1080,8 @@ gst_mmal_deinterlace_output_task_loop (GstMMALDeinterlace * self)
 
         GstBuffer *gstbuf = NULL;
 
-        GST_PAD_STREAM_LOCK (self->src_pad);
-
         flow_ret = gst_buffer_pool_acquire_buffer (self->output_gstpool,
             &gstbuf, NULL /* params */ );
-
-        GST_PAD_STREAM_UNLOCK (self->src_pad);
 
         if (flow_ret != GST_FLOW_OK) {
 

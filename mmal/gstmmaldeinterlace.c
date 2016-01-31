@@ -636,6 +636,29 @@ gst_mmal_deinterlace_set_src_caps (GstMMALDeinterlace * self, GstPad * pad,
   GST_DEBUG_OBJECT (self, "Format changed.  Need reconfigure on next buffer.");
   self->need_reconfigure = TRUE;
 
+  /* N.B. yes, still checking need_reconfigure here, in case we insert more
+     complicated decision-making above.
+
+     I'm "deconfiguring" here, rather than waiting until later for 2 reasons:
+
+     1) I want to be sure deinterlacer is drained of any buffers with "old"
+     format, and these are sent downstream before notifying downstream of a
+     format change.  And deconfigure() will call drain().
+
+     2) As far as possible, I want to avoid locking the src pad mutex when the
+     output task is running, as that increases the chances of deadlock.
+   */
+  if (self->need_reconfigure && !gst_mmal_deinterlace_deconfigure (self)) {
+
+    GST_ERROR_OBJECT (self, "Deconfigure failed!");
+    ret = FALSE;
+  }
+
+  /* Right, now output task should be stopped, (if it was even running in the
+     first place), and we should have sent any pending "old" buffers downstream.
+     I will now deal with telling downstream about the caps change.
+   */
+
   GST_MMAL_DEINTERLACE_STREAM_UNLOCK (self);
 
   GST_PAD_STREAM_LOCK (self->src_pad);
@@ -874,15 +897,6 @@ gst_mmal_deinterlace_chain (GstPad * pad, GstObject * object, GstBuffer * buf)
   if (GST_BUFFER_PTS_IS_VALID (buf)) {
     /* N.B. last_upstream_ts is used by drain() */
     self->last_upstream_ts = GST_BUFFER_PTS (buf);
-  }
-
-  if (self->need_reconfigure && !gst_mmal_deinterlace_deconfigure (self)) {
-    GST_ERROR_OBJECT (self, "Deconfigure failed!");
-
-    flow_ret = GST_FLOW_ERROR;
-
-    /* by this time output task should not be running */
-    goto done;
   }
 
   /* Progressive (non-interlaced) frames shall be passed directly to output */

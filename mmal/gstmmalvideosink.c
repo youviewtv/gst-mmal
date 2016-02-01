@@ -95,6 +95,11 @@ struct _GstMMALVideoSink
    */
   gboolean opaque;
 
+  /* This is required to avoid submitting the same buffer twice which the
+     renderer doesn't seem to like.  Only relevant in opaque mode.
+   */
+  MMAL_BUFFER_HEADER_T *last_mmal_buf;
+
   gboolean started;
 
   /* Dimensions of the connected screen */
@@ -331,6 +336,7 @@ gst_mmal_video_sink_init (GstMMALVideoSink * self)
 
   self->allocator = NULL;
   self->opaque = FALSE;
+  self->last_mmal_buf = NULL;
 
   self->started = FALSE;
 
@@ -746,6 +752,12 @@ gst_mmal_video_sink_show_frame (GstVideoSink * sink, GstBuffer * buffer)
        The reference we add here will be removed by our port callback:
        mmal_input_port_cb()
      */
+    if (mmal_buf == self->last_mmal_buf) {
+      return GST_FLOW_OK;
+    } else {
+      self->last_mmal_buf = mmal_buf;
+    }
+
     mmal_buffer_header_acquire (mmal_buf);
 
   } else {

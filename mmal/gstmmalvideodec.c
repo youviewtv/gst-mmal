@@ -940,8 +940,7 @@ gst_mmal_video_dec_drain (GstMMALVideoDec * self)
      */
     buffer->user_data = NULL;
 
-    buffer->pts = gst_util_uint64_scale (self->last_upstream_ts,
-        MMAL_TICKS_PER_SECOND, GST_SECOND);
+    buffer->pts = GST_TIME_AS_USECONDS (self->last_upstream_ts);
 
     GST_DEBUG_OBJECT (self, "Sending EOS with pts: %" G_GUINT64_FORMAT,
         (guint64) buffer->pts);
@@ -1251,8 +1250,7 @@ gst_mmal_video_dec_flush (GstVideoDecoder * decoder)
      */
     buffer->user_data = NULL;
 
-    buffer->pts = gst_util_uint64_scale (self->last_upstream_ts,
-        MMAL_TICKS_PER_SECOND, GST_SECOND);
+    buffer->pts = GST_TIME_AS_USECONDS (self->last_upstream_ts);
 
     GST_DEBUG_OBJECT (self,
         "Sending wakeup buffer with pts: %" G_GUINT64_FORMAT,
@@ -2338,8 +2336,7 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
 
     GST_DEBUG_OBJECT (self, "PTS: %lli", frame->pts);
 
-    pts_microsec = gst_util_uint64_scale (frame->pts, MMAL_TICKS_PER_SECOND,
-        GST_SECOND);
+    pts_microsec = GST_TIME_AS_USECONDS (frame->pts);
 
     /* N.B. last_upstream_ts is used by drain() */
     self->last_upstream_ts = frame->pts;
@@ -2357,8 +2354,7 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
 
     GST_DEBUG_OBJECT (self, "DTS: %lli", frame->dts);
 
-    dts_microsec = gst_util_uint64_scale (frame->dts, MMAL_TICKS_PER_SECOND,
-        GST_SECOND);
+    dts_microsec = GST_TIME_AS_USECONDS (frame->dts);
 
   } else {
     GST_DEBUG_OBJECT (self, "DTS: UNKNOWN!");

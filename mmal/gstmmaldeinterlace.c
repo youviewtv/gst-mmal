@@ -39,8 +39,6 @@
 
 #define GST_MMAL_DEINTERLACE_NUM_INPUT_BUFFERS 1
 
-#define MMAL_TICKS_PER_SECOND 1000000
-
 #define GST_MMAL_DEINTERLACE_INPUT_BUFFER_WAIT_FOR_MS 2000
 
 /* N.B. Drain timeout is quite high because with low-bitrate, low-fps stream, we
@@ -754,7 +752,7 @@ gst_mmal_deinterlace_drain (GstMMALDeinterlace * self)
      */
 
     wait_until = g_get_monotonic_time () +
-        1000 * GST_MMAL_DEINTERLACE_DRAIN_TIMEOUT_MS;
+        GST_MMAL_DEINTERLACE_DRAIN_TIMEOUT_MS * G_TIME_SPAN_MILLISECOND;
 
     if (!g_cond_wait_until (&self->drain_cond, &self->drain_lock, wait_until)) {
 
@@ -1139,11 +1137,11 @@ gst_mmal_deinterlace_output_task_loop (GstMMALDeinterlace * self)
         /* set correct GstBuffer fields to keep gst clocking correct */
         GST_BUFFER_PTS (gstbuf) =
             gst_util_uint64_scale (mmal_buffer->pts, GST_SECOND,
-            MMAL_TICKS_PER_SECOND);
+            G_USEC_PER_SEC);
 
         GST_BUFFER_DTS (gstbuf) =
             gst_util_uint64_scale (mmal_buffer->dts, GST_SECOND,
-            MMAL_TICKS_PER_SECOND);
+            G_USEC_PER_SEC);
 
         /* push data to output pad */
         flow_ret = gst_pad_push (self->src_pad, gstbuf);

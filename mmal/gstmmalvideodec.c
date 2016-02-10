@@ -37,7 +37,6 @@
 GST_DEBUG_CATEGORY_STATIC (gst_mmal_video_dec_debug_category);
 #define GST_CAT_DEFAULT gst_mmal_video_dec_debug_category
 
-#define MMAL_TICKS_PER_SECOND 1000000
 #define GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFER_HEADERS 3
 
 #define GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFERS_OPAQUE_MODE 20
@@ -968,7 +967,7 @@ gst_mmal_video_dec_drain (GstMMALVideoDec * self)
      */
 
     wait_until = g_get_monotonic_time () +
-        1000 * GST_MMAL_VIDEO_DEC_DRAIN_TIMEOUT_MS;
+        GST_MMAL_VIDEO_DEC_DRAIN_TIMEOUT_MS * G_TIME_SPAN_MILLISECOND;
 
     if (!g_cond_wait_until (&self->drain_cond, &self->drain_lock, wait_until)) {
 
@@ -1406,7 +1405,7 @@ gst_mmal_video_dec_output_clean_older_frames (GstMMALVideoDec * self,
 {
   GList *l;
   GstClockTime timestamp = gst_util_uint64_scale (buf->pts, GST_SECOND,
-      MMAL_TICKS_PER_SECOND);
+      G_USEC_PER_SEC);
 
   GST_DEBUG_OBJECT (self, "Cleaning older than: %lli", timestamp);
 
@@ -1477,8 +1476,7 @@ gst_mmal_video_dec_output_find_nearest_frame (MMAL_BUFFER_HEADER_T * buf,
   GstClockTime timestamp;
   GList *l;
 
-  timestamp = gst_util_uint64_scale ((int64_t) buf->pts, GST_SECOND,
-      MMAL_TICKS_PER_SECOND);
+  timestamp = gst_util_uint64_scale (buf->pts, GST_SECOND, G_USEC_PER_SEC);
 
   for (l = frames; l; l = l->next) {
 
@@ -1624,7 +1622,7 @@ gst_mmal_video_dec_output_fill_buffer (GstMMALVideoDec * self,
 done:
   if (ret) {
     GST_BUFFER_PTS (outbuf) =
-        gst_util_uint64_scale (inbuf->pts, GST_SECOND, MMAL_TICKS_PER_SECOND);
+        gst_util_uint64_scale (inbuf->pts, GST_SECOND, G_USEC_PER_SEC);
   }
 
   gst_video_codec_state_unref (state);

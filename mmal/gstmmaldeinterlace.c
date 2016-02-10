@@ -983,6 +983,7 @@ gst_mmal_deinterlace_output_task_loop (GstMMALDeinterlace * self)
   GstFlowReturn flow_ret = GST_FLOW_OK;
   uint32_t wait_for_buffer_timeout_ms = 250;
   gboolean draining = FALSE;
+  gboolean is_eos = FALSE;
 
   g_return_if_fail (self != NULL);
 
@@ -1049,12 +1050,12 @@ gst_mmal_deinterlace_output_task_loop (GstMMALDeinterlace * self)
 
       if ((mmal_buffer->flags & MMAL_BUFFER_HEADER_FLAG_EOS)) {
 
-        /* NOTE: EOS buffer might still have a final payload we need to process.
-           At the moment, I'm not expecting this to be the case, since EOS comes
-           from us sending (empty) EOS input buffer in drain()
+        /* NOTE: EOS buffer might still have a final payload we need to process
+           even though it comes from us sending (empty) EOS input buffer in
+           drain().
          */
         GST_DEBUG_OBJECT (self, "Buffer signals EOS.");
-        flow_ret = GST_FLOW_EOS;
+        is_eos = TRUE;
       }
 
       if (mmal_buffer->length) {
@@ -1125,7 +1126,7 @@ gst_mmal_deinterlace_output_task_loop (GstMMALDeinterlace * self)
     /* end-else (not an event) */
 
   done:
-    if (flow_ret == GST_FLOW_EOS) {
+    if (is_eos) {
 
       g_mutex_lock (&self->drain_lock);
 
@@ -1154,7 +1155,7 @@ gst_mmal_deinterlace_output_task_loop (GstMMALDeinterlace * self)
     GST_MMAL_DEINTERLACE_STREAM_LOCK (self);
 
     self->output_flow_ret = flow_ret;
-    self->started = !(draining || flow_ret != GST_FLOW_OK);
+    self->started = !((is_eos && draining) || flow_ret != GST_FLOW_OK);
 
     if (flow_ret != GST_FLOW_OK) {
       gst_pad_push_event (self->src_pad, gst_event_new_eos ());

@@ -80,6 +80,13 @@ Examples:
       --audiosink alsasink \
       http://rdmedia.bbc.co.uk/dash/ondemand/testcard/1/client_manifest-events.mpd
 
+
+    GST_GL_WINDOW=dispmanx gst-play-1.0 \
+      --videosink 'h264parse ! mmalh264dec ! mmalglupload ! glimagesinkelement' \
+      --audiosink alsasink \
+      http://rdmedia.bbc.co.uk/dash/ondemand/testcard/1/client_manifest-720p-stereo-events.mpd
+
+
 License:
 --------
 
@@ -111,3 +118,8 @@ Limitations:
     plain buffers causes some hang up on VC side, at least on Raspberry Pi
     (requires rebooting the device).  Using only plain buffers or only opaque
     buffers works.
+
+*   mmalglupload is experimental and somewhat hacky.  GST >= 1.7.2 is required
+    and downstream element must support `external-oes` texture target.
+    Adaptive streams are also not handled very well and mmalvideosink offers
+    better performance and much smoother playback if you don't need GL.

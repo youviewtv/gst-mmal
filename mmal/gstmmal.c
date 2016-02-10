@@ -31,6 +31,10 @@
 #include "gstmmalvideosink.h"
 #include "gstmmaldeinterlace.h"
 
+#ifdef ENABLE_MMALGLUPLOAD
+#include "gstmmalglupload.h"
+#endif
+
 #include <gst/gst.h>
 
 static gboolean
@@ -70,6 +74,12 @@ plugin_init (GstPlugin * plugin)
           GST_RANK_PRIMARY + 1, GST_TYPE_MMAL_DEINTERLACE)) {
     return FALSE;
   }
+#ifdef ENABLE_MMALGLUPLOAD
+  if (!gst_element_register (plugin, "mmalglupload",
+          GST_RANK_PRIMARY + 1, GST_TYPE_MMAL_GL_UPLOAD)) {
+    return FALSE;
+  }
+#endif
 
   return TRUE;
 }

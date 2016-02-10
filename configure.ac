@@ -136,6 +136,11 @@ AG_GST_GLIB_CHECK([2.32])
 dnl Needed by plugins that use g_module_*() API
 PKG_CHECK_MODULES(GMODULE_NO_EXPORT, gmodule-no-export-2.0)
 
+PKG_CHECK_MODULES([GST_GL], [gstreamer-gl-1.0 >= 1.7.2], [have_gst_gl="yes"],
+                  [have_gst_gl="no"])
+
+AM_CONDITIONAL([HAVE_GST_GL], [test x"$have_gst_gl" = "xyes"])
+
 dnl checks for gstreamer
 dnl uninstalled is selected preferentially -- see pkg-config(1)
 AG_GST_CHECK_GST($GST_API_VERSION, [$GST_REQ], yes)

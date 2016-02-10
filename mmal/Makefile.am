@@ -26,7 +26,8 @@ noinst_HEADERS = \
 	gstmmalwmvdec.h \
 	gstmmalvp6dec.h \
 	gstmmalvp8dec.h \
-	gstmmaldeinterlace.h
+	gstmmaldeinterlace.h \
+	gstmmalglupload.h
 
 # N.B. the `-fgnu89-inline` is there to suppress annoying "inline function
 # declared but never defined" warning from VC headers.
@@ -38,7 +39,7 @@ libgstmmal_la_CFLAGS = \
 	$(GST_CFLAGS) \
 	$(GMODULE_NO_EXPORT_CFLAGS) \
 	-fgnu89-inline \
-	-Wl,--no-as-needed -Wl,-lmmal -Wl,--as-needed
+	-Wl,--no-as-needed -Wl,-lmmal
 
 libgstmmal_la_LIBADD = \
 	-lbcm_host \
@@ -52,5 +53,11 @@ libgstmmal_la_LIBADD = \
 	$(GMODULE_NO_EXPORT_LIBS)
 
 libgstmmal_la_LDFLAGS = $(GST_PLUGIN_LDFLAGS)
+
+if HAVE_GST_GL
+libgstmmal_la_SOURCES += gstmmalglupload.c
+libgstmmal_la_CFLAGS += $(GST_GL_CFLAGS) -DENABLE_MMALGLUPLOAD=1
+libgstmmal_la_LIBADD += $(GST_GL_LIBS)
+endif
 
 EXTRA_DIST =

@@ -568,6 +568,10 @@ gst_mmal_deinterlace_set_src_caps (GstMMALDeinterlace * self, GstPad * pad,
 {
   gboolean ret = TRUE;
   GstCaps *src_caps = NULL;
+
+  GstVideoInfo *vinfo = NULL;
+  gint fps_n, fps_d;
+
   GstVideoInterlaceMode gst_interlacing_mode;
 
   g_return_val_if_fail (self != NULL, FALSE);
@@ -578,19 +582,32 @@ gst_mmal_deinterlace_set_src_caps (GstMMALDeinterlace * self, GstPad * pad,
 
   GST_MMAL_DEINTERLACE_STREAM_LOCK (self);
 
-  if (!gst_video_info_from_caps (&self->video_info, caps)) {
+  vinfo = &self->video_info;
+
+  if (!gst_video_info_from_caps (vinfo, caps)) {
     ret = FALSE;
     goto invalid_caps;
   }
 
-  gst_interlacing_mode = GST_VIDEO_INFO_INTERLACE_MODE (&self->video_info);
+  fps_n = GST_VIDEO_INFO_FPS_N (vinfo);
+  fps_d = GST_VIDEO_INFO_FPS_D (vinfo);
+
+  gst_interlacing_mode = GST_VIDEO_INFO_INTERLACE_MODE (vinfo);
 
   src_caps = gst_caps_copy (caps);
   src_caps = gst_caps_make_writable (src_caps);
 
-  gst_caps_set_simple (src_caps, "interlace-mode", G_TYPE_STRING,
-      "progressive", NULL);
+  gst_caps_set_simple (src_caps,
+      /* obviously on the output it's progressive mode */
+      "interlace-mode", G_TYPE_STRING, "progressive", NULL);
 
+  if (fps_d != 0) {
+    gst_caps_set_simple (src_caps,
+        /* deinterlacer doubles the frame rate */
+        "framerate", GST_TYPE_FRACTION, fps_n * 2, fps_d, NULL);
+  }
+
+  /* tell on the output only opaque mode is supported */
   gst_caps_set_features (src_caps, 0,
       gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_MMAL_OPAQUE, NULL));
 
@@ -610,7 +627,8 @@ gst_mmal_deinterlace_set_src_caps (GstMMALDeinterlace * self, GstPad * pad,
       break;
   }
 
-  self->frame_duration = 0;     /* 0 = full speed */
+  self->frame_duration = fps_n != 0 ?
+      G_GINT64_CONSTANT (1000000) * fps_d / fps_n : 0;
 
   /* Next time we see an input buffer, we need to configure port.
      We need to wait for this in order to see if we're opaque or not.
@@ -2000,6 +2018,12 @@ gst_mmal_deinterlace_setup_image_fx (GstMMALDeinterlace * self)
   }
 
   mmal_format_full_copy (output_format, input_format);
+  /* Deinterlacer doubles the frame rate on the output.  Not sure if frame rate
+   * configuration is respected in the output port format or whether the
+   * component works it out.  For consistency, we set it here to what we expect
+   * it to be.
+   */
+  output_format->es->video.frame_rate.num = self->video_info.fps_n * 2;
 
   GST_DEBUG_OBJECT (self, "buffers recommended (out): %u",
       output_port->buffer_num_recommended);

@@ -29,6 +29,7 @@
 #include "gstmmalvp6dec.h"
 #include "gstmmalvp8dec.h"
 #include "gstmmalvideosink.h"
+#include "gstmmaldeinterlace.h"
 
 #include <gst/gst.h>
 
@@ -62,6 +63,11 @@ plugin_init (GstPlugin * plugin)
 
   if (!gst_element_register (plugin, "mmalvideosink", GST_RANK_NONE,
           GST_TYPE_MMAL_VIDEO_SINK)) {
+    return FALSE;
+  }
+
+  if (!gst_element_register (plugin, "mmaldeinterlace",
+          GST_RANK_PRIMARY + 1, GST_TYPE_MMAL_DEINTERLACE)) {
     return FALSE;
   }
 

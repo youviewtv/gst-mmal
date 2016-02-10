@@ -1206,6 +1206,7 @@ gst_mmal_video_dec_flush (GstVideoDecoder * decoder)
   MMAL_BUFFER_HEADER_T *buffer = NULL;
   gboolean input_enabled = TRUE;
   gboolean output_enabled = TRUE;
+  gboolean started = self->started;
 
   GST_INFO_OBJECT (self, "flushing...");
 
@@ -1222,7 +1223,7 @@ gst_mmal_video_dec_flush (GstVideoDecoder * decoder)
   input_port = self->dec->input[0];
   output_port = self->dec->output[0];
 
-  if (self->started) {
+  if (started) {
 
     /* We stop the output task, but it can be blocked waiting on decoded frames
        queue.  We don't want to wait for that to time-out, so send a special
@@ -1269,6 +1270,7 @@ gst_mmal_video_dec_flush (GstVideoDecoder * decoder)
     GST_DEBUG_OBJECT (self, "Stopping output task...");
     if (gst_pad_stop_task (GST_VIDEO_DECODER_SRC_PAD (decoder))) {
       GST_DEBUG_OBJECT (self, "Output task stopped.");
+      /* No stream lock needed as output task is not running any more */
       self->started = FALSE;
     } else {
       GST_ERROR_OBJECT (self, "Failed to stop output task!");

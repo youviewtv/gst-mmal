@@ -1950,7 +1950,7 @@ gst_mmal_deinterlace_setup_image_fx (GstMMALDeinterlace * self)
     return FALSE;
   }
 
-  input_port->buffer_num = input_port->buffer_num_recommended;
+  input_port->buffer_num = GST_MMAL_NUM_OUTPUT_BUFFERS_OPAQUE_MODE;
   input_port->buffer_size = input_port->buffer_size_recommended;
 
   input_port->userdata = (void *) self;
@@ -1990,7 +1990,7 @@ gst_mmal_deinterlace_setup_image_fx (GstMMALDeinterlace * self)
 
   mmal_format_full_copy (output_format, input_format);
 
-  output_port->buffer_num = output_port->buffer_num_recommended;
+  output_port->buffer_num = GST_MMAL_NUM_OUTPUT_BUFFERS_OPAQUE_MODE;
   output_port->buffer_size = input_port->buffer_size;
 
   if (mmal_port_format_commit (output_port) != MMAL_SUCCESS) {

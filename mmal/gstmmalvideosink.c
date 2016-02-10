@@ -839,6 +839,10 @@ gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self)
   input = self->renderer->input[0];
   g_return_val_if_fail (input != NULL, FALSE);
 
+  input->buffer_num = self->opaque ?
+      GST_MMAL_NUM_OUTPUT_BUFFERS_OPAQUE_MODE : MMAL_BUFFER_NUM;
+  input->buffer_size = MAX_I420_BUFFER_SIZE;
+
   /* In opaque case we don't need any pool, but it's possible that we're
      switching from opaque to plain buffers, in which case we should destroy
      any existing pool.
@@ -853,9 +857,6 @@ gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self)
   }
 
   /* Rest is for plain buffers. */
-
-  input->buffer_num = MMAL_BUFFER_NUM;
-  input->buffer_size = MAX_I420_BUFFER_SIZE;
 
   frame_size = self->vinfo_padded ?
       GST_VIDEO_INFO_SIZE (self->vinfo_padded) : GST_VIDEO_INFO_SIZE (vinfo);

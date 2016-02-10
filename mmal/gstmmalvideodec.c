@@ -40,7 +40,6 @@ GST_DEBUG_CATEGORY_STATIC (gst_mmal_video_dec_debug_category);
 #define MMAL_TICKS_PER_SECOND 1000000
 #define GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFER_HEADERS 3
 
-#define GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFER_HEADERS_OPAQUE_MODE 20
 #define GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFERS_OPAQUE_MODE 20
 
 #define GST_MMAL_VIDEO_DEC_INPUT_BUFFER_WAIT_FOR_MS 2000
@@ -1727,8 +1726,7 @@ gst_mmal_video_dec_output_reconfigure_output_port (GstMMALVideoDec * self,
       return GST_FLOW_ERROR;
     }
 
-    output_port->buffer_num = output_port->buffer_num_recommended +
-        GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFER_HEADERS_OPAQUE_MODE;
+    output_port->buffer_num = GST_MMAL_NUM_OUTPUT_BUFFERS_OPAQUE_MODE;
 
   } else {
 

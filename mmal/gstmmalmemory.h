@@ -30,6 +30,17 @@
 
 G_BEGIN_DECLS
 
+/* Since we use upstream buffer allocation, components must agree on the number
+   of buffers used between them.  This is dictated by the requirement that the
+   number of buffers sent to MMAL port must not exceed the number of buffer
+   declared (`buffer_num`) when the port is enabled.  GPU needs to know how many
+   buffers to prepare for the port on its side.
+
+   If the number of buffers sent to the port exceeds `buffer_num`, we get
+   ENOMEM.
+ */
+#define GST_MMAL_NUM_OUTPUT_BUFFERS_OPAQUE_MODE 20
+
 /* --- MMAL OPAQUE MEMORY --- */
 
 #define GST_MMAL_OPAQUE_MEMORY_TYPE "MMALOpaque"

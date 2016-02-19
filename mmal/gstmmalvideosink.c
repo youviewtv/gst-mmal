@@ -34,6 +34,7 @@
 #include <interface/mmal/util/mmal_util.h>
 #include <interface/mmal/util/mmal_default_components.h>
 #include <interface/mmal/util/mmal_util_params.h>
+#include <interface/vmcs_host/vc_tvservice.h>
 
 #define MMAL_I420_STRIDE_ALIGN 32
 #define MMAL_I420_WIDTH_ALIGN GST_ROUND_UP_32
@@ -102,9 +103,6 @@ struct _GstMMALVideoSink
 
   gboolean started;
 
-  /* Dimensions of the connected screen */
-  uint32_t screen_w, screen_h;
-
   /* Requested video window */
   VideoWindow window;
 };
@@ -135,6 +133,11 @@ GST_DEBUG_CATEGORY (mmalvideosink_debug);
 #define gst_mmalvideosink_parent_class parent_class
 
 G_DEFINE_TYPE (GstMMALVideoSink, gst_mmal_video_sink, GST_TYPE_VIDEO_SINK);
+
+static gboolean gst_mmal_video_sink_get_display_size (GstMMALVideoSink * self,
+    uint32_t * width, uint32_t * height);
+static void gst_mmal_video_sink_tvservice_callback (void *context,
+    uint32_t reason, uint32_t param1, uint32_t param2);
 
 static void video_window_clamp (VideoWindow * vw);
 
@@ -222,6 +225,70 @@ gst_mmal_video_sink_class_init (GstMMALVideoSinkClass * klass)
 
   videosink_class->show_frame =
       GST_DEBUG_FUNCPTR (gst_mmal_video_sink_show_frame);
+}
+
+static gboolean
+gst_mmal_video_sink_get_display_size (GstMMALVideoSink * self, uint32_t * width,
+    uint32_t * height)
+{
+  MMAL_STATUS_T status = MMAL_SUCCESS;
+  MMAL_DISPLAYREGION_T display_region;
+  uint32_t w = 0;
+  uint32_t h = 0;
+
+  g_return_val_if_fail (self != NULL, FALSE);
+
+  display_region.hdr.id = MMAL_PARAMETER_DISPLAYREGION;
+  display_region.hdr.size = sizeof (MMAL_DISPLAYREGION_T);
+
+  status = mmal_port_parameter_get (self->renderer->input[0],
+      &display_region.hdr);
+  if (status != MMAL_SUCCESS) {
+    GST_ERROR_OBJECT (self, "Failed to get display region: %s (%u)",
+        mmal_status_to_string (status), status);
+    return FALSE;
+  }
+
+  if ((display_region.set & MMAL_DISPLAY_SET_NUM) == 0) {
+    GST_ERROR_OBJECT (self, "Failed to get display identifier");
+    return FALSE;
+  }
+
+  if (graphics_get_display_size (display_region.display_num, &w, &h) < 0) {
+    GST_ERROR_OBJECT (self, "Failed to get new display dimensions");
+    return FALSE;
+  }
+
+  GST_DEBUG_OBJECT (self, "New display resolution: %dx%d", w, h);
+
+  *width = w;
+  *height = h;
+
+  return TRUE;
+}
+
+
+/**
+ * VC TVService callback handler
+ *
+ * This is required for proper display resolution update handling,
+ * especially when playing on full screen.
+ */
+static void
+gst_mmal_video_sink_tvservice_callback (void *context, uint32_t reason,
+    uint32_t param1, uint32_t param2)
+{
+  GstMMALVideoSink *self = NULL;
+
+  g_return_if_fail (context != NULL);
+
+  self = GST_MMAL_VIDEO_SINK (context);
+  GST_DEBUG_OBJECT (self, "tvservice callback  (reason: 0x%X)", reason);
+
+  /* Ignore any other callback reasons */
+  if (reason & VC_HDMI_HDMI) {
+    gst_mmal_video_sink_set_render_rectangle (self);
+  }
 }
 
 /**
@@ -339,9 +406,6 @@ gst_mmal_video_sink_init (GstMMALVideoSink * self)
   self->last_mmal_buf = NULL;
 
   self->started = FALSE;
-
-  self->screen_w = 0;
-  self->screen_h = 0;
 
   self->window.x = 0.0;
   self->window.y = 0.0;
@@ -550,10 +614,7 @@ gst_mmal_video_sink_set_caps (GstBaseSink * sink, GstCaps * caps)
 static gboolean
 gst_mmal_video_sink_start (GstBaseSink * sink)
 {
-  MMAL_PORT_T *input = NULL;
-  MMAL_DISPLAYREGION_T display_region;
   MMAL_STATUS_T status;
-
   GstMMALVideoSink *self = NULL;
 
   g_return_val_if_fail (sink != NULL, FALSE);
@@ -577,43 +638,17 @@ gst_mmal_video_sink_start (GstBaseSink * sink)
     return FALSE;
   }
 
-  g_return_val_if_fail (self->renderer != NULL, FALSE);
-  g_return_val_if_fail (self->renderer->input != NULL, FALSE);
-
-  input = self->renderer->input[0];
-  g_return_val_if_fail (input != NULL, FALSE);
-
-  display_region.hdr.id = MMAL_PARAMETER_DISPLAYREGION;
-  display_region.hdr.size = sizeof (MMAL_DISPLAYREGION_T);
-
-  status = mmal_port_parameter_get (input, &display_region.hdr);
-  if (status != MMAL_SUCCESS) {
-    GST_ERROR_OBJECT (self, "Failed to get display region: %s (%u)",
-        mmal_status_to_string (status), status);
-    return FALSE;
-  }
-
-  if ((display_region.set & MMAL_DISPLAY_SET_NUM) == 0) {
-    GST_ERROR_OBJECT (self, "Failed to get display identifier");
-    return FALSE;
-  }
-
-  /* TODO:  This should be checked every time screen size is changed */
-  if (graphics_get_display_size (display_region.display_num,
-          &self->screen_w, &self->screen_h) < 0) {
-    GST_ERROR_OBJECT (self, "Failed to get display dimensions");
-    return FALSE;
-  }
-
   self->allocator = g_object_new (gst_mmal_opaque_allocator_get_type (), NULL);
 
   self->started = TRUE;
 
-  /* TODO:  This should be called every time screen size is updated */
   if (!gst_mmal_video_sink_set_render_rectangle (self)) {
     GST_ERROR_OBJECT (self, "Failed to set render rectangle");
     return FALSE;
   }
+
+  /* Enable tvservice callback for proper display resolution update support */
+  vc_tv_register_callback (gst_mmal_video_sink_tvservice_callback, self);
 
   return TRUE;
 }
@@ -629,6 +664,8 @@ gst_mmal_video_sink_stop (GstBaseSink * sink)
   GST_DEBUG_OBJECT (self, "stop");
 
   self->started = FALSE;
+
+  vc_tv_unregister_callback (gst_mmal_video_sink_tvservice_callback);
 
   gst_mmal_video_sink_disable_renderer (self);
 
@@ -1047,9 +1084,16 @@ gst_mmal_video_sink_set_render_rectangle (GstMMALVideoSink * self)
 {
   MMAL_DISPLAYREGION_T display_region;
   MMAL_STATUS_T status;
+  uint32_t width = 0;
+  uint32_t height = 0;
 
   g_return_val_if_fail (self != NULL, FALSE);
   g_return_val_if_fail (self->started, FALSE);
+
+  if (!gst_mmal_video_sink_get_display_size (self, &width, &height)) {
+    GST_ERROR_OBJECT (self, "Failed to get current display size");
+    return FALSE;
+  }
 
   GST_DEBUG_OBJECT (self, "video window: x=%f y=%f w=%f h=%f",
       self->window.x, self->window.y, self->window.width, self->window.height);
@@ -1062,8 +1106,8 @@ gst_mmal_video_sink_set_render_rectangle (GstMMALVideoSink * self)
 
   display_region.dest_rect.x = 0;
   display_region.dest_rect.y = 0;
-  display_region.dest_rect.width = self->screen_w;
-  display_region.dest_rect.height = self->screen_h;
+  display_region.dest_rect.width = width;
+  display_region.dest_rect.height = height;
 
   mmal_scale_rect (&self->window, &display_region.dest_rect);
   GST_DEBUG_OBJECT (self, "render rectangle: x=%d y=%d w=%d h=%d",

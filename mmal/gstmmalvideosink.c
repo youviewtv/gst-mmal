@@ -58,10 +58,10 @@
 #define MAX_I420_BUFFER_SIZE ((3 * MAX_I420_RES) / 2)
 
 #define GST_MMAL_VIDEO_SINK(obj) \
-  (G_TYPE_CHECK_INSTANCE_CAST((obj), GST_TYPE_MMALVIDEOSINK, GstMMALVideoSink))
+  (G_TYPE_CHECK_INSTANCE_CAST((obj), GST_TYPE_MMAL_VIDEO_SINK, GstMMALVideoSink))
 
 #define GST_MMAL_VIDEO_SINK_CLASS(klass) \
-  (G_TYPE_CHECK_CLASS_CAST((klass), GST_TYPE_MMALVIDEOSINK, GstMMALVideoSinkClass))
+  (G_TYPE_CHECK_CLASS_CAST((klass), GST_TYPE_MMAL_VIDEO_SINK, GstMMALVideoSinkClass))
 
 typedef struct _GstMMALVideoSink GstMMALVideoSink;
 typedef struct _GstMMAVideoSinkClass GstMMALVideoSinkClass;
@@ -130,7 +130,7 @@ enum
 GST_DEBUG_CATEGORY (mmalvideosink_debug);
 #define GST_CAT_DEFAULT mmalvideosink_debug
 
-#define gst_mmalvideosink_parent_class parent_class
+#define gst_mmal_video_sink_parent_class parent_class
 
 G_DEFINE_TYPE (GstMMALVideoSink, gst_mmal_video_sink, GST_TYPE_VIDEO_SINK);
 

@@ -3,6 +3,7 @@ plugin_LTLIBRARIES = libgstmmal.la
 libgstmmal_la_SOURCES = \
 	../ext/mmal/mmal_buffer_workaround.c \
 	gstmmal.c \
+	gstmmalclock.c \
 	gstmmalutil.c \
 	gstmmalmemory.c \
 	gstmmalh264dec.c \
@@ -15,6 +16,7 @@ libgstmmal_la_SOURCES = \
 	gstmmaldeinterlace.c
 
 noinst_HEADERS = \
+	gstmmalclock.h \
 	gstmmalutil.h \
 	gstmmalmemory.h \
 	gstmmalh264dec.h \

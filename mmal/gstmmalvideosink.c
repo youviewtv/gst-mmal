@@ -159,6 +159,16 @@ static MMAL_COMPONENT_T *gst_mmal_video_sink_create_component (GstMMALVideoSink
 static MMAL_CONNECTION_T *gst_mmal_video_sink_connect_ports (GstMMALVideoSink *
     self, MMAL_PORT_T * out, MMAL_PORT_T * in);
 
+static gboolean gst_mmal_enable_component (GstMMALVideoSink * self,
+    MMAL_COMPONENT_T * component);
+static gboolean gst_mmal_disable_component (GstMMALVideoSink * self,
+    MMAL_COMPONENT_T * component);
+
+static gboolean gst_mmal_enable_input_port (GstMMALVideoSink * self,
+    MMAL_PORT_T * in);
+static gboolean gst_mmal_disable_input_port (GstMMALVideoSink * self,
+    MMAL_PORT_T * in);
+
 static void gst_mmal_video_sink_get_property (GObject * object, guint prop_id,
     GValue * value, GParamSpec * pspec);
 static void gst_mmal_video_sink_set_property (GObject * object, guint prop_id,
@@ -185,10 +195,10 @@ static gboolean gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self);
 static gboolean gst_mmal_video_sink_configure (GstMMALVideoSink * self,
     gboolean opaque);
 
-static void gst_mmal_video_sink_disable_scheduler (GstMMALVideoSink * self);
+static gboolean gst_mmal_video_sink_disable_scheduler (GstMMALVideoSink * self);
 static gboolean gst_mmal_video_sink_enable_scheduler (GstMMALVideoSink * self);
 
-static void gst_mmal_video_sink_disable_renderer (GstMMALVideoSink * self);
+static gboolean gst_mmal_video_sink_disable_renderer (GstMMALVideoSink * self);
 static gboolean gst_mmal_video_sink_enable_renderer (GstMMALVideoSink * self);
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
@@ -378,7 +388,7 @@ gst_mmal_input_port_cb (MMAL_PORT_T * port, MMAL_BUFFER_HEADER_T * buffer)
   g_return_if_fail (buffer != NULL);
 
   self = GST_MMAL_VIDEO_SINK (port->userdata);
-  GST_TRACE_OBJECT (self, "input port callback");
+  GST_TRACE_OBJECT (self, "input port callback on %s", port->name);
 
   if (buffer->cmd != 0) {
     GST_DEBUG_OBJECT (self, "input port event: %u", buffer->cmd);
@@ -576,6 +586,116 @@ gst_mmal_video_sink_connect_ports (GstMMALVideoSink * self,
   }
 
   return connection;
+}
+
+static gboolean
+gst_mmal_enable_component (GstMMALVideoSink * self,
+    MMAL_COMPONENT_T * component)
+{
+  MMAL_STATUS_T status;
+
+  g_return_val_if_fail (self != NULL, FALSE);
+
+  if (component) {
+    g_return_val_if_fail (component->control != NULL, FALSE);
+
+    if (!component->control->is_enabled) {
+      component->control->userdata = (struct MMAL_PORT_USERDATA_T *) self;
+
+      status = mmal_port_enable (component->control, gst_mmal_control_port_cb);
+      if (status != MMAL_SUCCESS) {
+        GST_ERROR_OBJECT (self, "Failed to enable control port %s: %s (%u)",
+            component->control->name, mmal_status_to_string (status), status);
+        return FALSE;
+      }
+    }
+
+    if (!component->is_enabled) {
+      status = mmal_component_enable (component);
+      if (status != MMAL_SUCCESS) {
+        GST_ERROR_OBJECT (self, "Failed to enable component %s: %s (%u)",
+            component->name, mmal_status_to_string (status), status);
+        return FALSE;
+      }
+    }
+  }
+
+  return TRUE;
+}
+
+static gboolean
+gst_mmal_disable_component (GstMMALVideoSink * self,
+    MMAL_COMPONENT_T * component)
+{
+  MMAL_STATUS_T status;
+
+  g_return_val_if_fail (self != NULL, FALSE);
+
+  if (component) {
+    g_return_val_if_fail (component->control != NULL, FALSE);
+
+    if (component->control->is_enabled) {
+      status = mmal_port_disable (component->control);
+      if (status != MMAL_SUCCESS) {
+        GST_ERROR_OBJECT (self, "Failed to disable control port %s: %s (%u)",
+            component->control->name, mmal_status_to_string (status), status);
+        return FALSE;
+      }
+    }
+
+    if (component->is_enabled) {
+      status = mmal_component_disable (self->renderer);
+      if (status != MMAL_SUCCESS) {
+        GST_ERROR_OBJECT (self, "Failed to disable component %s: %s (%u)",
+            component->name, mmal_status_to_string (status), status);
+        return FALSE;
+      }
+    }
+  }
+
+  return TRUE;
+}
+
+static gboolean
+gst_mmal_enable_input_port (GstMMALVideoSink * self, MMAL_PORT_T * in)
+{
+  MMAL_STATUS_T status;
+
+  g_return_val_if_fail (self != NULL, FALSE);
+  g_return_val_if_fail (in != NULL, FALSE);
+
+  if (!in->is_enabled) {
+    in->userdata = (struct MMAL_PORT_USERDATA_T *) self;
+
+    status = mmal_port_enable (in, gst_mmal_input_port_cb);
+    if (status != MMAL_SUCCESS) {
+      GST_ERROR_OBJECT (self, "Failed to enable input port %s: %s (%u)",
+          in->name, mmal_status_to_string (status), status);
+      return FALSE;
+    }
+  }
+
+  return TRUE;
+}
+
+static gboolean
+gst_mmal_disable_input_port (GstMMALVideoSink * self, MMAL_PORT_T * in)
+{
+  MMAL_STATUS_T status;
+
+  g_return_val_if_fail (self != NULL, FALSE);
+  g_return_val_if_fail (in != NULL, FALSE);
+
+  if (in->is_enabled) {
+    status = mmal_port_disable (in);
+    if (status != MMAL_SUCCESS) {
+      GST_ERROR_OBJECT (self, "Failed to disable input port %s: %s (%u)",
+          in->name, mmal_status_to_string (status), status);
+      return FALSE;
+    }
+  }
+
+  return TRUE;
 }
 
 static GstClock *
@@ -1231,154 +1351,60 @@ gst_mmal_video_sink_configure (GstMMALVideoSink * self, gboolean opaque)
   return configured;
 }
 
-static void
+static gboolean
 gst_mmal_video_sink_disable_scheduler (GstMMALVideoSink * self)
 {
-  g_return_if_fail (self != NULL);
+  g_return_val_if_fail (self != NULL, FALSE);
 
   if (self->scheduler) {
-    g_return_if_fail (self->scheduler->control != NULL);
+    g_return_val_if_fail (self->scheduler->input != NULL, FALSE);
+    g_return_val_if_fail (self->scheduler->input[0] != NULL, FALSE);
 
-    if (self->scheduler->control->is_enabled) {
-      mmal_port_disable (self->scheduler->control);
-    }
+    g_return_val_if_fail (self->scheduler->clock != NULL, FALSE);
+    g_return_val_if_fail (self->scheduler->clock[0] != NULL, FALSE);
 
-    g_return_if_fail (self->scheduler->input != NULL);
-    g_return_if_fail (self->scheduler->input[0] != NULL);
-
-    if (self->scheduler->input[0]->is_enabled) {
-      mmal_port_disable (self->scheduler->input[0]);
-    }
-
-    if (self->scheduler->is_enabled) {
-      mmal_component_disable (self->scheduler);
-    }
+    return gst_mmal_disable_input_port (self, self->scheduler->input[0]) &&
+        gst_mmal_disable_input_port (self, self->scheduler->clock[0]) &&
+        gst_mmal_disable_component (self, self->scheduler);
   }
+
+  return TRUE;
 }
 
 static gboolean
 gst_mmal_video_sink_enable_scheduler (GstMMALVideoSink * self)
 {
-  MMAL_PORT_T *input = NULL;
-  MMAL_STATUS_T status;
-
   g_return_val_if_fail (self != NULL, FALSE);
 
   if (self->scheduler) {
-    g_return_val_if_fail (self->scheduler->control != NULL, FALSE);
-
-    if (!self->scheduler->control->is_enabled) {
-      self->scheduler->control->userdata = (struct MMAL_PORT_USERDATA_T *) self;
-
-      status =
-          mmal_port_enable (self->scheduler->control, gst_mmal_control_port_cb);
-      if (status != MMAL_SUCCESS) {
-        GST_ERROR_OBJECT (self,
-            "Failed to enable control port %s: %s (%u)",
-            self->scheduler->control->name, mmal_status_to_string (status),
-            status);
-        return FALSE;
-      }
-    }
-
     g_return_val_if_fail (self->scheduler->input != NULL, FALSE);
+    g_return_val_if_fail (self->scheduler->input[0] != NULL, FALSE);
 
-    input = self->scheduler->input[0];
-    g_return_val_if_fail (input != NULL, FALSE);
+    g_return_val_if_fail (self->scheduler->clock != NULL, FALSE);
+    g_return_val_if_fail (self->scheduler->clock[0] != NULL, FALSE);
 
-    if (!input->is_enabled) {
-      input->userdata = (struct MMAL_PORT_USERDATA_T *) self;
-
-      status = mmal_port_enable (input, gst_mmal_input_port_cb);
-      if (status != MMAL_SUCCESS) {
-        GST_ERROR_OBJECT (self,
-            "Failed to enable input port %s: %s (%u)",
-            input->name, mmal_status_to_string (status), status);
-        return FALSE;
-      }
-    }
-
-    if (!self->scheduler->clock[0]->is_enabled) {
-      input->userdata = (struct MMAL_PORT_USERDATA_T *) self;
-
-      status =
-          mmal_port_enable (self->scheduler->clock[0], gst_mmal_input_port_cb);
-      if (status != MMAL_SUCCESS) {
-        GST_ERROR_OBJECT (self,
-            "Failed to enable input port %s: %s (%u)",
-            input->name, mmal_status_to_string (status), status);
-        return FALSE;
-      }
-    }
-
-    if (!self->scheduler->is_enabled) {
-      status = mmal_component_enable (self->scheduler);
-      if (status != MMAL_SUCCESS) {
-        GST_ERROR_OBJECT (self,
-            "Failed to enable scheduler component: %s (%u)",
-            mmal_status_to_string (status), status);
-        return FALSE;
-      }
-    }
+    return gst_mmal_enable_input_port (self, self->scheduler->input[0]) &&
+        gst_mmal_enable_input_port (self, self->scheduler->clock[0]) &&
+        gst_mmal_enable_component (self, self->scheduler);
   }
 
   return TRUE;
 }
 
-static void
+static gboolean
 gst_mmal_video_sink_disable_renderer (GstMMALVideoSink * self)
 {
-  g_return_if_fail (self != NULL);
+  g_return_val_if_fail (self != NULL, FALSE);
 
-  if (self->renderer) {
-    g_return_if_fail (self->renderer->control != NULL);
-
-    if (self->renderer->control->is_enabled) {
-      mmal_port_disable (self->renderer->control);
-    }
-
-    if (self->renderer->is_enabled) {
-      mmal_component_disable (self->renderer);
-    }
-  }
+  return gst_mmal_disable_component (self, self->renderer);
 }
 
 static gboolean
 gst_mmal_video_sink_enable_renderer (GstMMALVideoSink * self)
 {
-  MMAL_STATUS_T status;
-
   g_return_val_if_fail (self != NULL, FALSE);
 
-  if (self->renderer) {
-    g_return_val_if_fail (self->renderer->control != NULL, FALSE);
-
-    if (!self->renderer->control->is_enabled) {
-      self->renderer->control->userdata = (struct MMAL_PORT_USERDATA_T *) self;
-
-      status =
-          mmal_port_enable (self->renderer->control, gst_mmal_control_port_cb);
-      if (status != MMAL_SUCCESS) {
-        GST_ERROR_OBJECT (self,
-            "Failed to enable control port %s: %s (%u)",
-            self->renderer->control->name, mmal_status_to_string (status),
-            status);
-        return FALSE;
-      }
-    }
-
-    if (!self->renderer->is_enabled) {
-      status = mmal_component_enable (self->renderer);
-      if (status != MMAL_SUCCESS) {
-        GST_ERROR_OBJECT (self,
-            "Failed to enable renderer component: %s (%u)",
-            mmal_status_to_string (status), status);
-        return FALSE;
-      }
-    }
-  }
-
-  return TRUE;
+  return gst_mmal_enable_component (self, self->renderer);
 }
 
 /**

@@ -845,14 +845,6 @@ gst_mmal_video_sink_start (GstBaseSink * sink)
   }
 
   status = mmal_port_parameter_set_boolean (self->scheduler->clock[0],
-      MMAL_PARAMETER_CLOCK_REFERENCE, MMAL_TRUE);
-  if (status != MMAL_SUCCESS) {
-    GST_ERROR_OBJECT (self, "Failed to set clock reference: %s (%u)",
-        mmal_status_to_string (status), status);
-    return FALSE;
-  }
-
-  status = mmal_port_parameter_set_boolean (self->scheduler->clock[0],
       MMAL_PARAMETER_CLOCK_ACTIVE, MMAL_TRUE);
   if (status != MMAL_SUCCESS) {
     GST_ERROR_OBJECT (self, "Failed to set clock active: %s (%u)",

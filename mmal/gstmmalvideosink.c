@@ -137,15 +137,15 @@ static void gst_mmal_video_sink_tvservice_callback (void *context,
 
 static void video_window_clamp (VideoWindow * vw);
 
-static gboolean mmal_port_supports_format_change (MMAL_PORT_T * port);
+static gboolean gst_mmal_port_supports_format_change (MMAL_PORT_T * port);
 
-static void mmal_control_port_cb (MMAL_PORT_T * port,
+static void gst_mmal_control_port_cb (MMAL_PORT_T * port,
     MMAL_BUFFER_HEADER_T * buffer);
-static void mmal_input_port_cb (MMAL_PORT_T * port,
+static void gst_mmal_input_port_cb (MMAL_PORT_T * port,
     MMAL_BUFFER_HEADER_T * buffer);
-static void mmal_connection_cb (MMAL_CONNECTION_T * connection);
+static void gst_mmal_connection_cb (MMAL_CONNECTION_T * connection);
 
-static void mmal_scale_rect (const VideoWindow * vw, MMAL_RECT_T * rect);
+static void gst_mmal_scale_rect (const VideoWindow * vw, MMAL_RECT_T * rect);
 
 static gboolean gst_mmal_video_sink_set_render_rectangle (GstMMALVideoSink *
     self);
@@ -326,13 +326,13 @@ video_window_clamp (VideoWindow * vw)
 }
 
 static gboolean
-mmal_port_supports_format_change (MMAL_PORT_T * port)
+gst_mmal_port_supports_format_change (MMAL_PORT_T * port)
 {
   return port->capabilities & MMAL_PORT_CAPABILITY_SUPPORTS_EVENT_FORMAT_CHANGE;
 }
 
 static void
-mmal_control_port_cb (MMAL_PORT_T * port, MMAL_BUFFER_HEADER_T * buffer)
+gst_mmal_control_port_cb (MMAL_PORT_T * port, MMAL_BUFFER_HEADER_T * buffer)
 {
   GstMMALVideoSink *self = NULL;
   MMAL_STATUS_T status;
@@ -360,7 +360,7 @@ mmal_control_port_cb (MMAL_PORT_T * port, MMAL_BUFFER_HEADER_T * buffer)
  * Here we use those proportions to calculate the actual MMAL video rectangle.
  */
 static void
-mmal_scale_rect (const VideoWindow * vw, MMAL_RECT_T * rect)
+gst_mmal_scale_rect (const VideoWindow * vw, MMAL_RECT_T * rect)
 {
   rect->x = rect->width * vw->x;
   rect->y = rect->height * vw->y;
@@ -369,7 +369,7 @@ mmal_scale_rect (const VideoWindow * vw, MMAL_RECT_T * rect)
 }
 
 static void
-mmal_input_port_cb (MMAL_PORT_T * port, MMAL_BUFFER_HEADER_T * buffer)
+gst_mmal_input_port_cb (MMAL_PORT_T * port, MMAL_BUFFER_HEADER_T * buffer)
 {
   GstMMALVideoSink *self = NULL;
 
@@ -404,7 +404,7 @@ mmal_input_port_cb (MMAL_PORT_T * port, MMAL_BUFFER_HEADER_T * buffer)
 }
 
 static void
-mmal_connection_cb (MMAL_CONNECTION_T * connection)
+gst_mmal_connection_cb (MMAL_CONNECTION_T * connection)
 {
   GstMMALVideoSink *self = NULL;
 
@@ -978,7 +978,7 @@ gst_mmal_video_sink_prepare (GstBaseSink * sink, GstBuffer * buffer)
        handled by a specialised MMAL Pool implementation.
 
        The reference we add here will be removed by our port callback:
-       mmal_input_port_cb()
+       gst_mmal_input_port_cb()
      */
     if (mmal_buf == self->last_mmal_buf) {
       return GST_FLOW_OK;
@@ -1147,7 +1147,7 @@ gst_mmal_video_sink_configure (GstMMALVideoSink * self, gboolean opaque)
      something funky to change buffer type after initial negotiation, this
      requires disable & flush.
    */
-  if (!mmal_port_supports_format_change (input)) {
+  if (!gst_mmal_port_supports_format_change (input)) {
 
     gst_mmal_video_sink_disable_scheduler (self);
 
@@ -1210,7 +1210,7 @@ gst_mmal_video_sink_configure (GstMMALVideoSink * self, gboolean opaque)
 
   if (!self->connection->is_enabled) {
     self->connection->user_data = self;
-    self->connection->callback = mmal_connection_cb;
+    self->connection->callback = gst_mmal_connection_cb;
 
     status = mmal_connection_enable (self->connection);
     if (status != MMAL_SUCCESS) {
@@ -1271,7 +1271,7 @@ gst_mmal_video_sink_enable_scheduler (GstMMALVideoSink * self)
       self->scheduler->control->userdata = (struct MMAL_PORT_USERDATA_T *) self;
 
       status =
-          mmal_port_enable (self->scheduler->control, mmal_control_port_cb);
+          mmal_port_enable (self->scheduler->control, gst_mmal_control_port_cb);
       if (status != MMAL_SUCCESS) {
         GST_ERROR_OBJECT (self,
             "Failed to enable control port %s: %s (%u)",
@@ -1289,7 +1289,7 @@ gst_mmal_video_sink_enable_scheduler (GstMMALVideoSink * self)
     if (!input->is_enabled) {
       input->userdata = (struct MMAL_PORT_USERDATA_T *) self;
 
-      status = mmal_port_enable (input, mmal_input_port_cb);
+      status = mmal_port_enable (input, gst_mmal_input_port_cb);
       if (status != MMAL_SUCCESS) {
         GST_ERROR_OBJECT (self,
             "Failed to enable input port %s: %s (%u)",
@@ -1301,7 +1301,8 @@ gst_mmal_video_sink_enable_scheduler (GstMMALVideoSink * self)
     if (!self->scheduler->clock[0]->is_enabled) {
       input->userdata = (struct MMAL_PORT_USERDATA_T *) self;
 
-      status = mmal_port_enable (self->scheduler->clock[0], mmal_input_port_cb);
+      status =
+          mmal_port_enable (self->scheduler->clock[0], gst_mmal_input_port_cb);
       if (status != MMAL_SUCCESS) {
         GST_ERROR_OBJECT (self,
             "Failed to enable input port %s: %s (%u)",
@@ -1355,7 +1356,8 @@ gst_mmal_video_sink_enable_renderer (GstMMALVideoSink * self)
     if (!self->renderer->control->is_enabled) {
       self->renderer->control->userdata = (struct MMAL_PORT_USERDATA_T *) self;
 
-      status = mmal_port_enable (self->renderer->control, mmal_control_port_cb);
+      status =
+          mmal_port_enable (self->renderer->control, gst_mmal_control_port_cb);
       if (status != MMAL_SUCCESS) {
         GST_ERROR_OBJECT (self,
             "Failed to enable control port %s: %s (%u)",
@@ -1413,7 +1415,7 @@ gst_mmal_video_sink_set_render_rectangle (GstMMALVideoSink * self)
   display_region.dest_rect.width = width;
   display_region.dest_rect.height = height;
 
-  mmal_scale_rect (&self->window, &display_region.dest_rect);
+  gst_mmal_scale_rect (&self->window, &display_region.dest_rect);
   GST_DEBUG_OBJECT (self, "render rectangle: x=%d y=%d w=%d h=%d",
       display_region.dest_rect.x, display_region.dest_rect.y,
       display_region.dest_rect.width, display_region.dest_rect.height);

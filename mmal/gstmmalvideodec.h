@@ -104,6 +104,8 @@ struct _GstMMALVideoDec
   gboolean opaque;
 
   gboolean output_reconfigured;
+
+  gint flushing;
 };
 
 struct _GstMMALVideoDecClass

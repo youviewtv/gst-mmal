@@ -96,6 +96,8 @@ struct _GstMMALDeinterlace
   GCond drain_cond;
   gboolean draining;
 
+  /* shared (atomic) */
+  gint flushing;
 
   /* ---- INPUT STATE ---- */
   GstPad *sink_pad;
@@ -255,7 +257,10 @@ static gboolean gst_mmal_deinterlace_start (GstMMALDeinterlace * self);
 static gboolean gst_mmal_deinterlace_stop (GstMMALDeinterlace * self);
 
 static GstFlowReturn gst_mmal_deinterlace_drain (GstMMALDeinterlace * self);
-static gboolean gst_mmal_deinterlace_flush (GstMMALDeinterlace * self,
+
+static gboolean gst_mmal_deinterlace_flush_start (GstMMALDeinterlace * self,
+    gboolean stop);
+static gboolean gst_mmal_deinterlace_flush_stop (GstMMALDeinterlace * self,
     gboolean stop);
 
 static gboolean gst_mmal_deinterlace_ports_enable (GstMMALDeinterlace * self);
@@ -356,6 +361,8 @@ gst_mmal_deinterlace_init (GstMMALDeinterlace * self)
   g_mutex_init (&self->drain_lock);
   g_cond_init (&self->drain_cond);
 
+  self->flushing = FALSE;
+
   self->output_gstpool = NULL;
 
   /* MMAL */
@@ -423,6 +430,18 @@ gst_mmal_deinterlace_change_state (GstElement * element,
       break;
     case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
       break;
+
+    case GST_STATE_CHANGE_PAUSED_TO_READY:
+      GST_MMAL_DEINTERLACE_STREAM_LOCK (self);
+
+      if (!gst_mmal_deinterlace_flush_start (self, TRUE)) {
+        ret = GST_STATE_CHANGE_FAILURE;
+      }
+
+      GST_MMAL_DEINTERLACE_STREAM_UNLOCK (self);
+
+      break;
+
     default:
       break;
   }
@@ -515,9 +534,14 @@ gst_mmal_deinterlace_get_property (GObject * object, guint prop_id,
 static gboolean
 gst_mmal_deinterlace_deconfigure (GstMMALDeinterlace * self)
 {
+  GstFlowReturn flow_ret;
+
   GST_DEBUG_OBJECT (self, "Draining deinterlace...");
 
-  if (gst_mmal_deinterlace_drain (self) != GST_FLOW_OK) {
+  flow_ret = gst_mmal_deinterlace_drain (self);
+  if (flow_ret == GST_FLOW_FLUSHING) {
+    return TRUE;
+  } else if (flow_ret != GST_FLOW_OK) {
     GST_ERROR_OBJECT (self, "Drain failed!");
     return FALSE;
   }
@@ -704,6 +728,10 @@ gst_mmal_deinterlace_drain (GstMMALDeinterlace * self)
 
   } else {
 
+    /* Hold this mutex before sending EOS buffer, otherwise we have a race. */
+    g_mutex_lock (&self->drain_lock);
+    self->draining = TRUE;
+
     /* Grab a buffer */
     GST_DEBUG_OBJECT (self, "Waiting for input buffer...");
 
@@ -728,10 +756,6 @@ gst_mmal_deinterlace_drain (GstMMALDeinterlace * self)
 
     GST_DEBUG_OBJECT (self, "Sending EOS with pts: %" G_GUINT64_FORMAT,
         (guint64) buffer->pts);
-
-    /* Hold this mutex before sending EOS buffer, otherwise we have a race. */
-    g_mutex_lock (&self->drain_lock);
-    self->draining = TRUE;
 
     if (mmal_port_send_buffer (self->image_fx->input[0], buffer) !=
         MMAL_SUCCESS) {
@@ -761,9 +785,15 @@ gst_mmal_deinterlace_drain (GstMMALDeinterlace * self)
 
       flow_ret = GST_FLOW_ERROR;
       goto drain_failed;
-    }
+    } else if (g_atomic_int_get (&self->flushing)) {
 
-    GST_DEBUG_OBJECT (self, "Drained deinterlace.");
+      GST_DEBUG_OBJECT (self, "Flushing: not drained.");
+      flow_ret = GST_FLOW_FLUSHING;
+
+    } else {
+
+      GST_DEBUG_OBJECT (self, "Drained deinterlace.");
+    }
 
   drain_failed:
     self->draining = FALSE;
@@ -812,12 +842,22 @@ gst_mmal_deinterlace_sink_event (GstPad * pad, GstObject * parent,
       ret = ret && gst_pad_push_event (self->src_pad, event);
       break;
 
-    case GST_EVENT_FLUSH_STOP:
+    case GST_EVENT_FLUSH_START:
+      ret = gst_pad_push_event (self->src_pad, event);
+
       GST_MMAL_DEINTERLACE_STREAM_LOCK (self);
-      ret = gst_mmal_deinterlace_flush (self, FALSE);
+      ret = ret && gst_mmal_deinterlace_flush_start (self, FALSE);
       GST_MMAL_DEINTERLACE_STREAM_UNLOCK (self);
 
-      ret = ret && gst_pad_push_event (self->src_pad, event);
+      break;
+
+    case GST_EVENT_FLUSH_STOP:
+      ret = gst_pad_push_event (self->src_pad, event);
+
+      GST_MMAL_DEINTERLACE_STREAM_LOCK (self);
+      ret = ret && gst_mmal_deinterlace_flush_stop (self, FALSE);
+      GST_MMAL_DEINTERLACE_STREAM_UNLOCK (self);
+
       break;
 
     default:
@@ -886,6 +926,13 @@ gst_mmal_deinterlace_chain (GstPad * pad, GstObject * object, GstBuffer * buf)
   g_return_val_if_fail (self->image_fx != NULL, GST_FLOW_ERROR);
 
   GST_MMAL_DEINTERLACE_STREAM_LOCK (self);
+
+  if (g_atomic_int_get (&self->flushing)) {
+    GST_DEBUG_OBJECT (self, "Flushing: not processing input frame");
+    gst_buffer_unref (buf);
+    flow_ret = GST_FLOW_FLUSHING;
+    goto done;
+  }
 
   if (self->output_flow_ret != GST_FLOW_OK) {
     GST_ERROR_OBJECT (self, "Output task reported error, stop processing data");
@@ -1152,7 +1199,7 @@ gst_mmal_deinterlace_output_task_loop (GstMMALDeinterlace * self)
     /* end-else (not an event) */
 
   done:
-    if (is_eos) {
+    if (is_eos || g_atomic_int_get (&self->flushing)) {
 
       g_mutex_lock (&self->drain_lock);
 
@@ -1173,6 +1220,9 @@ gst_mmal_deinterlace_output_task_loop (GstMMALDeinterlace * self)
            whatever it is up to.
          */
         gst_pad_pause_task (self->src_pad);
+      } else {
+
+        GST_DEBUG_OBJECT (self, "EOS seen on output thread");
       }
 
       g_mutex_unlock (&self->drain_lock);
@@ -1512,6 +1562,7 @@ gst_mmal_deinterlace_open (GstMMALDeinterlace * self)
   bcm_host_init ();
 
   self->started = FALSE;
+  self->flushing = FALSE;
 
   /* Create the image_fx component on VideoCore */
   status =
@@ -1607,6 +1658,8 @@ gst_mmal_deinterlace_start (GstMMALDeinterlace * self)
   /* N.B. This is actually set in handle_frame() */
   self->started = FALSE;
 
+  self->flushing = FALSE;
+
   GST_MMAL_DEINTERLACE_STREAM_UNLOCK (self);
 
   g_mutex_lock (&self->drain_lock);
@@ -1629,14 +1682,9 @@ gst_mmal_deinterlace_stop (GstMMALDeinterlace * self)
 {
   GST_DEBUG_OBJECT (self, "Stopping deinterlacer");
 
-  gst_mmal_deinterlace_flush (self, TRUE);
+  gst_mmal_deinterlace_flush_stop (self, TRUE);
 
   self->output_flow_ret = GST_FLOW_FLUSHING;
-
-  g_mutex_lock (&self->drain_lock);
-  self->draining = FALSE;
-  g_cond_broadcast (&self->drain_cond);
-  g_mutex_unlock (&self->drain_lock);
 
   gst_mmal_deinterlace_ports_disable (self);
   mmal_component_disable (self->image_fx);
@@ -1664,31 +1712,46 @@ gst_mmal_deinterlace_stop (GstMMALDeinterlace * self)
  * next call to handle_frame().
  */
 static gboolean
-gst_mmal_deinterlace_flush (GstMMALDeinterlace * self, gboolean stop)
+gst_mmal_deinterlace_flush_start (GstMMALDeinterlace * self, gboolean stop)
 {
-  MMAL_PORT_T *input_port = NULL;
-  MMAL_PORT_T *output_port = NULL;
-  MMAL_BUFFER_HEADER_T *buffer = NULL;
-  gboolean started = self->started;
+  MMAL_STATUS_T status;
 
+  gboolean started = self->started;
   GstClockTime pts = GST_TIME_AS_USECONDS (self->last_upstream_ts);
 
-  GST_INFO_OBJECT (self, "Flushing...");
+  gboolean ret = FALSE;
+
+  g_atomic_int_set (&self->flushing, TRUE);
+
+  GST_DEBUG_OBJECT (self, "Flush start...");
 
   if (!self->image_fx) {
-    GST_ERROR_OBJECT (self, "Deinterlace component not yet created!");
+    GST_WARNING_OBJECT (self, "Deinterlace component not yet created!");
     return TRUE;
   }
+
+  /* This should wake up input stream thread waiting for an input buffer */
+  status = mmal_port_flush (self->image_fx->input[0]);
+  if (status != MMAL_SUCCESS) {
+    GST_ERROR_OBJECT (self, "Failed to flush input port: %d (%s)",
+        status, mmal_status_to_string (status));
+    return FALSE;
+  }
+
+  g_mutex_lock (&self->drain_lock);
+  GST_DEBUG_OBJECT (self, "Flushing: signalling drain done");
+  self->draining = FALSE;
+  g_cond_broadcast (&self->drain_cond);
+  g_mutex_unlock (&self->drain_lock);
 
   /* Yield the "big lock" before blocking on input buffer avail (see below).
      It's easier if we release it here, since we re-aquire at the end.
    */
   GST_MMAL_DEINTERLACE_STREAM_UNLOCK (self);
 
-  input_port = self->image_fx->input[0];
-  output_port = self->image_fx->output[0];
-
   if (started) {
+
+    MMAL_BUFFER_HEADER_T *buffer = NULL;
 
     /* We stop the output task, but it can be blocked waiting on decoded frames
        queue.  We don't want to wait for that to time-out, so send a special
@@ -1701,7 +1764,7 @@ gst_mmal_deinterlace_flush (GstMMALDeinterlace * self, gboolean stop)
                 GST_MMAL_DEINTERLACE_INPUT_BUFFER_WAIT_FOR_MS)) == NULL) {
 
       GST_ERROR_OBJECT (self, "Failed to acquire input buffer!");
-      goto flush_failed;
+      goto done;
     }
 
     GST_DEBUG_OBJECT (self, "Got input buffer");
@@ -1721,7 +1784,7 @@ gst_mmal_deinterlace_flush (GstMMALDeinterlace * self, gboolean stop)
 
       GST_ERROR_OBJECT (self, "Failed to send input buffer to decoder!");
       mmal_buffer_header_release (buffer);
-      goto flush_failed;
+      goto done;
     }
 
     /* Stop the task (and wait for it to stop) */
@@ -1733,16 +1796,38 @@ gst_mmal_deinterlace_flush (GstMMALDeinterlace * self, gboolean stop)
       self->started = FALSE;
     } else {
       GST_ERROR_OBJECT (self, "Failed to stop output task!");
-      goto flush_failed;
+      goto done;
     }
   }
   /* end-if (already running) */
 
+  ret = TRUE;
+
+done:
+  GST_MMAL_DEINTERLACE_STREAM_LOCK (self);
+
+  return ret;
+}
+
+static gboolean
+gst_mmal_deinterlace_flush_stop (GstMMALDeinterlace * self, gboolean stop)
+{
+  MMAL_PORT_T *input_port = NULL;
+  MMAL_PORT_T *output_port = NULL;
+
+  GST_DEBUG_OBJECT (self, "Flush stop...");
+
+  if (!self->image_fx) {
+    GST_ERROR_OBJECT (self, "Deinterlace component not yet created!");
+    return TRUE;
+  }
+
+  input_port = self->image_fx->input[0];
+  output_port = self->image_fx->output[0];
 
   /* OK, so now we don't need to worry about output side. We can fiddle with
-     it's state.
+     it's state as the output task was stopped in FLUSH_START.
    */
-
   if (stop && input_port->is_enabled &&
       mmal_port_disable (input_port) != MMAL_SUCCESS) {
     GST_ERROR_OBJECT (self, "Failed to disable input port!");
@@ -1769,6 +1854,9 @@ gst_mmal_deinterlace_flush (GstMMALDeinterlace * self, gboolean stop)
   }
 
   if (self->output_queue != NULL) {
+
+    MMAL_BUFFER_HEADER_T *buffer = NULL;
+
     /* Free any decoded frames */
     while ((buffer = mmal_queue_get (self->output_queue))) {
 
@@ -1796,10 +1884,10 @@ gst_mmal_deinterlace_flush (GstMMALDeinterlace * self, gboolean stop)
 
   GST_PAD_STREAM_UNLOCK (self->src_pad);
 
-  GST_MMAL_DEINTERLACE_STREAM_LOCK (self);
-
   self->last_upstream_ts = 0;
   self->output_flow_ret = GST_FLOW_OK;
+
+  g_atomic_int_set (&self->flushing, FALSE);
 
   return TRUE;
 
@@ -1809,7 +1897,6 @@ output_flush_failed:
 
 flush_failed:
 
-  GST_MMAL_DEINTERLACE_STREAM_LOCK (self);
   return FALSE;
 }
 

@@ -188,6 +188,9 @@ static gboolean gst_mmal_video_sink_stop (GstBaseSink * sink);
 static GstFlowReturn gst_mmal_video_sink_prepare (GstBaseSink * sink,
     GstBuffer * buffer);
 
+static gboolean gst_mmal_video_sink_event (GstBaseSink * sink,
+    GstEvent * event);
+
 static GstFlowReturn gst_mmal_video_sink_show_frame (GstVideoSink * videosink,
     GstBuffer * buffer);
 
@@ -247,6 +250,7 @@ gst_mmal_video_sink_class_init (GstMMALVideoSinkClass * klass)
   basesink_class->prepare = GST_DEBUG_FUNCPTR (gst_mmal_video_sink_prepare);
   basesink_class->propose_allocation =
       GST_DEBUG_FUNCPTR (gst_mmal_video_sink_propose_allocation);
+  basesink_class->event = GST_DEBUG_FUNCPTR (gst_mmal_video_sink_event);
 
   videosink_class->show_frame =
       GST_DEBUG_FUNCPTR (gst_mmal_video_sink_show_frame);
@@ -984,7 +988,8 @@ gst_mmal_video_sink_prepare (GstBaseSink * sink, GstBuffer * buffer)
   pts = GST_BUFFER_PTS (buffer);
 
   running_time =
-      gst_segment_to_running_time (&sink->segment, GST_FORMAT_TIME, pts);
+      gst_segment_to_running_time (&sink->segment, GST_FORMAT_TIME, pts) +
+      gst_element_get_base_time (GST_ELEMENT (sink));
 
   /* See gst_base_sink_adjust_time() */
   latency = gst_base_sink_get_latency (sink);
@@ -1059,6 +1064,10 @@ gst_mmal_video_sink_prepare (GstBaseSink * sink, GstBuffer * buffer)
     GST_TRACE_OBJECT (sink,
         "gst clk: %" GST_TIME_FORMAT ", mmal clk: %" GST_TIME_FORMAT,
         GST_TIME_ARGS (clk_time), GST_TIME_ARGS (vc_time));
+    GST_TRACE_OBJECT (sink,
+        "base time: %" GST_TIME_FORMAT ", start time: %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (gst_element_get_base_time (GST_ELEMENT (sink))),
+        GST_TIME_ARGS (gst_element_get_start_time (GST_ELEMENT (sink))));
 
     if (G_LIKELY (running_time > vc_time)) {
       GST_TRACE_OBJECT (self, "Buffer time OK");
@@ -1163,6 +1172,39 @@ error_map_buffer:
   mmal_buffer_header_release (mmal_buf);
   GST_ERROR_OBJECT (self, "Failed to map frame buffer for reading");
   return GST_FLOW_ERROR;
+}
+
+static gboolean
+gst_mmal_video_sink_event (GstBaseSink * sink, GstEvent * event)
+{
+  MMAL_STATUS_T status;
+  GstMMALVideoSink *self;
+
+  GST_TRACE_OBJECT (sink, "Event: %s", GST_EVENT_TYPE_NAME (event));
+
+  self = GST_MMAL_VIDEO_SINK (sink);
+
+  switch (GST_EVENT_TYPE (event)) {
+
+    case GST_EVENT_FLUSH_START:
+      g_return_val_if_fail (self->scheduler, FALSE);
+      g_return_val_if_fail (self->scheduler->input, FALSE);
+      g_return_val_if_fail (self->scheduler->input[0], FALSE);
+
+      status = mmal_port_flush (self->scheduler->input[0]);
+      if (status != MMAL_SUCCESS) {
+        GST_ERROR_OBJECT (self, "Failed to flush scheduler: %s (%u)",
+            mmal_status_to_string (status), status);
+        return FALSE;
+      }
+
+      break;
+
+    default:
+      break;
+  }
+
+  return GST_BASE_SINK_CLASS (parent_class)->event (sink, event);
 }
 
 static GstFlowReturn

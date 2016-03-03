@@ -2292,6 +2292,7 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
   int64_t pts_microsec = 0;
   int64_t dts_microsec = 0;
   GstFlowReturn flow_ret = GST_FLOW_OK;
+  uint32_t mmal_buffer_flags = 0;
 
   GstMMALVideoDec *self = GST_MMAL_VIDEO_DEC (decoder);
 
@@ -2321,6 +2322,8 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
       /* Output task not running yet.  Start it. */
 
       GST_DEBUG_OBJECT (self, "Starting output task...");
+
+      mmal_buffer_flags |= MMAL_BUFFER_HEADER_FLAG_DISCONTINUITY;
 
       gst_pad_start_task (GST_VIDEO_DECODER_SRC_PAD (self),
           (GstTaskFunction) gst_mmal_video_dec_output_task_loop, decoder, NULL);
@@ -2452,6 +2455,8 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
     mmal_buffer->dts = dts_microsec;
 
     /* Flags */
+    mmal_buffer->flags |= mmal_buffer_flags;
+
     if (input_offset == 0) {
       mmal_buffer->flags |= MMAL_BUFFER_HEADER_FLAG_FRAME_START;
 

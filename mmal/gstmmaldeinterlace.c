@@ -1586,7 +1586,7 @@ gst_mmal_deinterlace_close (GstMMALDeinterlace * self)
 
   GST_DEBUG_OBJECT (self, "Closing deinterlacer");
 
-  if (self->image_fx->control != NULL) {
+  if (self->image_fx->control != NULL && self->image_fx->control->is_enabled) {
     mmal_port_disable (self->image_fx->control);
   }
 

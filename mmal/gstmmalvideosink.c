@@ -872,7 +872,9 @@ gst_mmal_video_sink_start (GstBaseSink * sink)
   /* Enable tvservice callback for proper display resolution update support */
   vc_tv_register_callback (gst_mmal_video_sink_tvservice_callback, self);
 
-  return gst_mmal_video_sink_enable_renderer (self) &&
+  return gst_mmal_enable_input_port (self, self->scheduler->clock[0]) &&
+      gst_mmal_enable_component (self, self->scheduler) &&
+      gst_mmal_video_sink_enable_renderer (self) &&
       gst_element_post_message (GST_ELEMENT (self),
       gst_message_new_clock_provide (GST_OBJECT (self), self->clk, TRUE));
 }

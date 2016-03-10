@@ -1517,27 +1517,6 @@ gst_mmal_deinterlace_configure_image_fx (GstMMALDeinterlace * self)
     }
   }
 
-#if 0
-  /* MMAL returns error when trying to set these params... is it R/O param? */
-  {
-    MMAL_PARAMETER_VIDEO_INTERLACE_TYPE_T int_type_param;
-
-    memset (&int_type_param, 0, sizeof (MMAL_PARAMETER_VIDEO_INTERLACE_TYPE_T));
-
-    int_type_param.hdr.id = MMAL_PARAMETER_VIDEO_INTERLACE_TYPE;
-    int_type_param.hdr.size = sizeof (MMAL_PARAMETER_VIDEO_INTERLACE_TYPE_T);
-    int_type_param.eMode = self->interlace_type;
-    int_type_param.bRepeatFirstField = self->want_repeat_first_field;
-
-    if (mmal_port_parameter_set (input_port,
-            &int_type_param.hdr) != MMAL_SUCCESS) {
-      GST_ERROR_OBJECT (self,
-          "Failed to configure deinterlacer input port (type)");
-      return FALSE;
-    }
-  }
-#endif
-
   GST_DEBUG_OBJECT (self,
       "MMAL deinterlace configuration: "
       "mode: %d (%s), type: %d (%s), RFF: %d, frame duration: %d",

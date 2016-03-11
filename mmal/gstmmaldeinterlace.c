@@ -1535,6 +1535,13 @@ gst_mmal_deinterlace_open (GstMMALDeinterlace * self)
     }
   }
 
+  self->output_queue = mmal_queue_create ();
+
+  if (self->output_queue == NULL) {
+    GST_ERROR_OBJECT (self, "Failed to create output buffer queue!");
+    return FALSE;
+  }
+
   GST_DEBUG_OBJECT (self, "Opened deinterlacer");
 
   return TRUE;
@@ -1551,6 +1558,31 @@ gst_mmal_deinterlace_close (GstMMALDeinterlace * self)
 
   if (self->image_fx->control != NULL) {
     mmal_port_disable (self->image_fx->control);
+  }
+
+  GST_DEBUG_OBJECT (self, "Freeing deinterlaced frames queue");
+
+  if (self->output_queue != NULL) {
+    mmal_queue_destroy (self->output_queue);
+    self->output_queue = NULL;
+  }
+
+  GST_DEBUG_OBJECT (self, "Freeing output buffer pool");
+
+  if (self->output_buffer_pool != NULL) {
+    uint32_t output_buffers;
+
+    output_buffers = mmal_queue_length (self->output_buffer_pool->queue);
+
+    if (output_buffers != self->image_fx->output[0]->buffer_num) {
+      GST_ERROR_OBJECT (self,
+          "Failed to reclaim all output buffers (%u out of %u)",
+          output_buffers, self->image_fx->output[0]->buffer_num);
+    }
+
+    mmal_port_pool_destroy (self->image_fx->output[0],
+        self->output_buffer_pool);
+    self->output_buffer_pool = NULL;
   }
 
   mmal_component_destroy (self->image_fx);
@@ -1582,14 +1614,6 @@ gst_mmal_deinterlace_start (GstMMALDeinterlace * self)
   g_mutex_unlock (&self->drain_lock);
 
   GST_PAD_STREAM_LOCK (self->src_pad);
-
-  self->output_queue = mmal_queue_create ();
-
-  if (self->output_queue == NULL) {
-    GST_ERROR_OBJECT (self, "Failed to create output buffer queue!");
-    GST_PAD_STREAM_UNLOCK (self->src_pad);
-    return FALSE;
-  }
 
   self->image_fx->output[0]->userdata = (void *) self->output_queue;
 
@@ -1624,19 +1648,7 @@ gst_mmal_deinterlace_stop (GstMMALDeinterlace * self)
 
   GST_PAD_STREAM_LOCK (self->src_pad);
 
-  if (self->output_queue != NULL) {
-    mmal_queue_destroy (self->output_queue);
-    self->output_queue = NULL;
-  }
-
-  if (self->output_buffer_pool != NULL) {
-    mmal_port_pool_destroy (self->image_fx->output[0],
-        self->output_buffer_pool);
-    self->output_buffer_pool = NULL;
-  }
-
   gst_buffer_pool_set_active (self->output_gstpool, FALSE);
-
   gst_object_replace ((GstObject **) & self->output_gstpool, NULL);
 
   GST_PAD_STREAM_UNLOCK (self->src_pad);
@@ -1768,7 +1780,6 @@ gst_mmal_deinterlace_flush (GstMMALDeinterlace * self, gboolean stop)
   if (stop) {
     /* At this point, we expect to have all our buffers back. */
     uint32_t input_buffers;
-    uint32_t output_buffers;
 
     if (self->input_buffer_pool != NULL) {
 
@@ -1780,22 +1791,6 @@ gst_mmal_deinterlace_flush (GstMMALDeinterlace * self, gboolean stop)
             input_buffers, input_port->buffer_num);
         goto output_flush_failed;
       }
-    }
-
-    if (self->output_buffer_pool != NULL) {
-
-      output_buffers = mmal_queue_length (self->output_buffer_pool->queue);
-
-      /* N.B. I don't think we can expect all of the output buffers to be
-         returned since downstream elements like the renderer can be holding
-         them.
-
-         What we do expect though is that the decoder has released the buffers
-         that it was holding onto itself.
-       */
-      GST_DEBUG_OBJECT (self,
-          "Reclaimed output buffers (%d out of %d)",
-          output_buffers, output_port->buffer_num);
     }
   }
 

@@ -273,6 +273,8 @@ gst_mmal_video_dec_open (GstVideoDecoder * decoder)
     return FALSE;
   }
 
+  self->decoded_frames_queue = mmal_queue_create ();
+
   self->started = FALSE;
 
   GST_DEBUG_OBJECT (self, "Opened decoder");
@@ -304,6 +306,36 @@ gst_mmal_video_dec_close (GstVideoDecoder * decoder)
 
     GST_ERROR_OBJECT (self, "Failed to disable decoder component!");
     return FALSE;
+  }
+
+  GST_DEBUG_OBJECT (self, "Freeing decoded frames queue");
+
+  if (self->decoded_frames_queue) {
+    mmal_queue_destroy (self->decoded_frames_queue);
+    self->decoded_frames_queue = NULL;
+  }
+
+  GST_DEBUG_OBJECT (self, "Freeing output buffer pool");
+
+  if (self->output_buffer_pool_opaque != NULL) {
+    uint32_t output_buffers;
+
+    output_buffers = mmal_queue_length (self->output_buffer_pool_opaque->queue);
+
+    if (output_buffers != self->dec->output[0]->buffer_num) {
+      GST_ERROR_OBJECT (self,
+          "Failed to reclaim all output buffers (%u out of %u)",
+          output_buffers, self->dec->output[0]->buffer_num);
+    }
+
+    mmal_port_pool_destroy (self->dec->output[0],
+        self->output_buffer_pool_opaque);
+    self->output_buffer_pool_opaque = NULL;
+  }
+
+  if (self->output_buffer_pool_plain != NULL) {
+    mmal_pool_destroy (self->output_buffer_pool_plain);
+    self->output_buffer_pool_plain = NULL;
   }
 
   mmal_component_destroy (self->dec);
@@ -361,7 +393,6 @@ gst_mmal_video_dec_start (GstVideoDecoder * decoder)
   self->output_reconfigured = FALSE;
   self->output_buffer_flags = 0;
 
-  self->decoded_frames_queue = mmal_queue_create ();
   self->dec->output[0]->userdata = (void *) self;
 
   GST_PAD_STREAM_UNLOCK (GST_VIDEO_DECODER_SRC_PAD (self));
@@ -429,26 +460,6 @@ gst_mmal_video_dec_stop (GstVideoDecoder * decoder)
 
     GST_ERROR_OBJECT (self, "Failed to disable output port!");
     success = FALSE;
-  }
-
-  GST_DEBUG_OBJECT (self, "Freeing decoded frames queue");
-
-  if (self->decoded_frames_queue) {
-    mmal_queue_destroy (self->decoded_frames_queue);
-    self->decoded_frames_queue = NULL;
-  }
-
-  GST_DEBUG_OBJECT (self, "Freeing output buffer pool");
-
-  if (self->output_buffer_pool_opaque != NULL) {
-    mmal_port_pool_destroy (self->dec->output[0],
-        self->output_buffer_pool_opaque);
-    self->output_buffer_pool_opaque = NULL;
-  }
-
-  if (self->output_buffer_pool_plain != NULL) {
-    mmal_pool_destroy (self->output_buffer_pool_plain);
-    self->output_buffer_pool_plain = NULL;
   }
 
   self->output_buffer_pool = NULL;
@@ -1325,7 +1336,6 @@ gst_mmal_video_dec_flush_internal (GstVideoDecoder * decoder, gboolean stop)
   if (stop) {
     /* At this point, we expect to have all our buffers back. */
     uint32_t input_buffers;
-    uint32_t output_buffers;
 
     if (self->input_buffer_pool != NULL) {
 
@@ -1337,21 +1347,6 @@ gst_mmal_video_dec_flush_internal (GstVideoDecoder * decoder, gboolean stop)
             input_buffers, input_port->buffer_num);
         goto output_flush_failed;
       }
-    }
-
-    if (self->output_buffer_pool != NULL) {
-
-      output_buffers = mmal_queue_length (self->output_buffer_pool->queue);
-
-      /* N.B. I don't think we can expect all of the output buffers to be
-         returned since downstream elements like the renderer can be holding
-         them.
-
-         What we do expect though is that the decoder has released the buffers
-         that it was holding onto itself.
-       */
-      GST_DEBUG_OBJECT (self, "Reclaimed output buffers (%d out of %d)",
-          output_buffers, output_port->buffer_num);
     }
   }
 

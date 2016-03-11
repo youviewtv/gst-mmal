@@ -901,6 +901,11 @@ gst_mmal_video_sink_stop (GstBaseSink * sink)
   gst_mmal_video_sink_disable_renderer (self);
   gst_mmal_video_sink_disable_scheduler (self);
 
+  if (mmal_port_flush (self->scheduler->input[0]) != MMAL_SUCCESS) {
+    GST_ERROR_OBJECT (self, "Failed to flush input port");
+    return FALSE;
+  }
+
   if (self->pool) {
     mmal_port_pool_destroy (self->scheduler->input[0], self->pool);
     self->pool = NULL;

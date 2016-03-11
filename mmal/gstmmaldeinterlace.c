@@ -687,7 +687,7 @@ gst_mmal_deinterlace_set_src_caps (GstMMALDeinterlace * self, GstPad * pad,
   GST_PAD_STREAM_LOCK (self->src_pad);
 
   if (!gst_pad_set_caps (self->src_pad, src_caps)) {
-    GST_ERROR_OBJECT (self, "Failed to set caps on src pad");
+    GST_ERROR_OBJECT (self, "Failed to set caps on src pad!");
     ret = FALSE;
   }
 
@@ -700,7 +700,7 @@ gst_mmal_deinterlace_set_src_caps (GstMMALDeinterlace * self, GstPad * pad,
 invalid_caps:
   GST_MMAL_DEINTERLACE_STREAM_UNLOCK (self);
 
-  GST_ERROR_OBJECT (pad, "Invalid caps");
+  GST_ERROR_OBJECT (pad, "Invalid caps!");
   return FALSE;
 }
 
@@ -754,8 +754,9 @@ gst_mmal_deinterlace_drain (GstMMALDeinterlace * self)
     buffer->flags |= MMAL_BUFFER_HEADER_FLAG_EOS;
     buffer->pts = pts;
 
-    GST_DEBUG_OBJECT (self, "Sending EOS with pts: %" G_GUINT64_FORMAT,
-        (guint64) buffer->pts);
+    GST_DEBUG_OBJECT (self, "Sending EOS with PTS: %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (gst_util_uint64_scale (buffer->pts, GST_SECOND,
+                G_USEC_PER_SEC)));
 
     if (mmal_port_send_buffer (self->image_fx->input[0], buffer) !=
         MMAL_SUCCESS) {
@@ -888,7 +889,7 @@ gst_mmal_deinterlace_sink_query (GstPad * pad, GstObject * parent,
     case GST_QUERY_ALLOCATION:
       res = gst_pad_peer_query (self->src_pad, query);
       if (!res) {
-        GST_ERROR_OBJECT (self, "gst_pad_peer_query() failed");
+        GST_ERROR_OBJECT (self, "gst_pad_peer_query() failed!");
       }
 
       GST_PAD_STREAM_LOCK (self->src_pad);
@@ -896,8 +897,7 @@ gst_mmal_deinterlace_sink_query (GstPad * pad, GstObject * parent,
       GST_PAD_STREAM_UNLOCK (self->src_pad);
 
       if (!res) {
-        GST_ERROR_OBJECT (self,
-            "gst_mmal_deinterlace_alloc_output_gst_pool() failed");
+        GST_ERROR_OBJECT (self, "Allocating output buffer pool failed!");
       }
       break;
     default:
@@ -928,7 +928,7 @@ gst_mmal_deinterlace_chain (GstPad * pad, GstObject * object, GstBuffer * buf)
   GST_MMAL_DEINTERLACE_STREAM_LOCK (self);
 
   if (g_atomic_int_get (&self->flushing)) {
-    GST_DEBUG_OBJECT (self, "Flushing: not processing input frame");
+    GST_DEBUG_OBJECT (self, "Flushing: not processing input frame.");
     gst_buffer_unref (buf);
     flow_ret = GST_FLOW_FLUSHING;
     goto done;
@@ -951,12 +951,13 @@ gst_mmal_deinterlace_chain (GstPad * pad, GstObject * object, GstBuffer * buf)
     GST_MMAL_DEINTERLACE_STREAM_UNLOCK (self);
 
     GST_DEBUG_OBJECT (self,
-        "Progressive frame.  Pushing directly to output pad (PTS=%lld)",
-        GST_BUFFER_PTS (buf));
+        "Progressive frame.  Pushing directly to output pad "
+        "(PTS=%" GST_TIME_FORMAT ")", GST_TIME_ARGS (GST_BUFFER_PTS (buf)));
 
     GST_TRACE_OBJECT (self,
-        "Progressive frame: time: %" GST_TIME_FORMAT ", dur: %" GST_TIME_FORMAT
-        ", end: %" GST_TIME_FORMAT, GST_TIME_ARGS (GST_BUFFER_TIMESTAMP (buf)),
+        "Progressive frame: time stamp: %" GST_TIME_FORMAT
+        ", duration: %" GST_TIME_FORMAT ", end: %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (GST_BUFFER_TIMESTAMP (buf)),
         GST_TIME_ARGS (GST_BUFFER_DURATION (buf)),
         GST_TIME_ARGS (GST_BUFFER_TIMESTAMP (buf) + GST_BUFFER_DURATION (buf)));
 
@@ -965,7 +966,7 @@ gst_mmal_deinterlace_chain (GstPad * pad, GstObject * object, GstBuffer * buf)
   }
 
   if (self->need_reconfigure && !gst_mmal_deinterlace_configure (self)) {
-    GST_ERROR_OBJECT (self, "Reconfigure failed!");
+    GST_ERROR_OBJECT (self, "Reconfiguration failed!");
 
     flow_ret = GST_FLOW_ERROR;
     goto done;
@@ -983,7 +984,8 @@ gst_mmal_deinterlace_chain (GstPad * pad, GstObject * object, GstBuffer * buf)
   is_opaque = gst_is_mmal_opaque_memory (gst_buffer_peek_memory (buf, 0));
   if (!is_opaque) {
     GST_ERROR_OBJECT (self,
-        "Not a MMAL Opaque buffer (PTS=%lld)", GST_BUFFER_PTS (buf));
+        "Not a MMAL opaque buffer (PTS=%" GST_TIME_FORMAT ")",
+        GST_TIME_ARGS (GST_BUFFER_PTS (buf)));
 
     flow_ret = GST_FLOW_ERROR;
     goto done_unlocked;
@@ -991,7 +993,8 @@ gst_mmal_deinterlace_chain (GstPad * pad, GstObject * object, GstBuffer * buf)
 
   if (self->output_gstpool == NULL) {
     GST_ERROR_OBJECT (self,
-        "Output pool is NULL (PTS=%lld)", GST_BUFFER_PTS (buf));
+        "Output buffer pool is not set up (PTS=%" GST_TIME_FORMAT ")",
+        GST_TIME_ARGS (GST_BUFFER_PTS (buf)));
     flow_ret = GST_FLOW_ERROR;
     goto done_unlocked;
   }
@@ -1001,17 +1004,18 @@ gst_mmal_deinterlace_chain (GstPad * pad, GstObject * object, GstBuffer * buf)
   mmal_buffer =
       gst_mmal_opaque_mem_get_mmal_header (gst_buffer_peek_memory (buf, 0));
   if (mmal_buffer == NULL) {
-    GST_ERROR_OBJECT (self, "Failed to get MMAL Buffer Header from buffer (%p)",
+    GST_ERROR_OBJECT (self, "Failed to get MMAL buffer header from buffer (%p)",
         buf);
     flow_ret = GST_FLOW_ERROR;
     goto done_unlocked;
   }
 
+  GST_DEBUG_OBJECT (self,
+      "Sending MMAL input buffer: %p, PTS: %" GST_TIME_FORMAT, mmal_buffer,
+      GST_TIME_ARGS (GST_BUFFER_PTS (buf)));
+
   mmal_buffer_header_acquire (mmal_buffer);
   gst_buffer_unref (buf);
-
-  GST_DEBUG_OBJECT (self, "Sending MMAL input buffer: %p, PTS: %lld",
-      mmal_buffer, mmal_buffer->pts);
 
   status = mmal_port_send_buffer (self->image_fx->input[0], mmal_buffer);
   if (status != MMAL_SUCCESS) {
@@ -1021,7 +1025,7 @@ gst_mmal_deinterlace_chain (GstPad * pad, GstObject * object, GstBuffer * buf)
     goto done_unlocked;
   }
 
-  GST_DEBUG_OBJECT (self, "OK");
+  GST_DEBUG_OBJECT (self, "Buffer sent.");
 
 done_unlocked:
   return flow_ret;
@@ -1046,7 +1050,7 @@ gst_mmal_deinterlace_start_output_task (GstMMALDeinterlace * self)
 
     self->started = TRUE;
   } else {
-    GST_WARNING_OBJECT (self, "Output task is already running");
+    GST_WARNING_OBJECT (self, "Output task is already running.");
   }
 }
 
@@ -1067,7 +1071,7 @@ gst_mmal_deinterlace_output_task_loop (GstMMALDeinterlace * self)
   GST_TRACE_OBJECT (self, "Output task waken up");
 
   if (!gst_mmal_deinterlace_populate_output_port (self)) {
-    GST_ERROR_OBJECT (self, "Failed to populate output port with buffers");
+    GST_ERROR_OBJECT (self, "Failed to populate output port with buffers!");
 
     gst_pad_push_event (self->src_pad, gst_event_new_eos ());
     gst_pad_pause_task (self->src_pad);
@@ -1098,19 +1102,19 @@ gst_mmal_deinterlace_output_task_loop (GstMMALDeinterlace * self)
       switch (mmal_buffer->cmd) {
 
         case MMAL_EVENT_EOS:
-          GST_DEBUG_OBJECT (self, "Got EOS");
+          GST_DEBUG_OBJECT (self, "Got EOS.");
           flow_ret = GST_FLOW_EOS;
           break;
         case MMAL_EVENT_ERROR:
           /* TODO: Pull-out some useful info. */
-          GST_WARNING_OBJECT (self, "TODO: Got Error");
+          GST_WARNING_OBJECT (self, "TODO: Got error.");
           flow_ret = GST_FLOW_ERROR;
           break;
         case MMAL_EVENT_FORMAT_CHANGED:
           GST_DEBUG_OBJECT (self, "TODO: Output port format changed.");
           break;
         case MMAL_EVENT_PARAMETER_CHANGED:
-          GST_DEBUG_OBJECT (self, "TODO: Parameter changed");
+          GST_DEBUG_OBJECT (self, "TODO: Parameter changed.");
           break;
       }
 
@@ -1122,8 +1126,9 @@ gst_mmal_deinterlace_output_task_loop (GstMMALDeinterlace * self)
 
     } else {
 
-      GST_DEBUG_OBJECT (self, "Handling output frame: %" G_GUINT64_FORMAT,
-          (guint64) mmal_buffer->pts);
+      GST_DEBUG_OBJECT (self, "Handling output frame: %" GST_TIME_FORMAT,
+          GST_TIME_ARGS (gst_util_uint64_scale (mmal_buffer->pts,
+                  GST_SECOND, G_USEC_PER_SEC)));
 
       if ((mmal_buffer->flags & MMAL_BUFFER_HEADER_FLAG_EOS)) {
 
@@ -1144,7 +1149,7 @@ gst_mmal_deinterlace_output_task_loop (GstMMALDeinterlace * self)
 
         if (flow_ret != GST_FLOW_OK) {
 
-          GST_ERROR_OBJECT (self, "Cannot get buffer from MMAL Opaque pool");
+          GST_ERROR_OBJECT (self, "Cannot get buffer from MMAL Opaque pool!");
           goto done;
 
         } else {
@@ -1153,33 +1158,12 @@ gst_mmal_deinterlace_output_task_loop (GstMMALDeinterlace * self)
 
           if (mem == NULL || !gst_is_mmal_opaque_memory (mem)) {
 
-            GST_ERROR_OBJECT (self, "Expected MMAL Opaque GstMemory");
+            GST_ERROR_OBJECT (self, "Expected MMAL Opaque GstMemory!");
             flow_ret = GST_FLOW_ERROR;
             goto done;
           } else {
             gst_mmal_opaque_mem_set_mmal_header (mem, mmal_buffer);
           }
-        }
-
-
-        if (gst_debug_category_get_threshold (GST_CAT_DEFAULT)
-            >= GST_LEVEL_DEBUG) {
-
-          char encoding[5];
-          char encoding_variant[5];
-
-          MMAL_ES_FORMAT_T *format = self->image_fx->output[0]->format;
-
-          GST_DEBUG_OBJECT (self,
-              "Sending buffer downstream: %p (MMAL: %p) PTS=%lld %dx%d "
-              "(%dx%d) encoding=%s variant=%s",
-              gstbuf, mmal_buffer, mmal_buffer->pts,
-              format->es->video.width, format->es->video.height,
-              format->es->video.crop.width, format->es->video.crop.height,
-              mmal_4cc_to_string (encoding, sizeof (encoding),
-                  format->encoding),
-              mmal_4cc_to_string (encoding_variant, sizeof (encoding_variant),
-                  format->encoding_variant));
         }
 
         /* set correct GstBuffer fields to keep gst clocking correct */
@@ -1190,6 +1174,26 @@ gst_mmal_deinterlace_output_task_loop (GstMMALDeinterlace * self)
         GST_BUFFER_DTS (gstbuf) =
             gst_util_uint64_scale (mmal_buffer->dts, GST_SECOND,
             G_USEC_PER_SEC);
+
+        if (gst_debug_category_get_threshold (GST_CAT_DEFAULT)
+            >= GST_LEVEL_DEBUG) {
+
+          char encoding[5];
+          char encoding_variant[5];
+
+          MMAL_ES_FORMAT_T *format = self->image_fx->output[0]->format;
+
+          GST_DEBUG_OBJECT (self,
+              "Sending buffer downstream: %p (MMAL: %p) PTS=%" GST_TIME_FORMAT
+              " %dx%d (%dx%d) encoding=%s variant=%s",
+              gstbuf, mmal_buffer, GST_TIME_ARGS (GST_BUFFER_PTS (gstbuf)),
+              format->es->video.width, format->es->video.height,
+              format->es->video.crop.width, format->es->video.crop.height,
+              mmal_4cc_to_string (encoding, sizeof (encoding),
+                  format->encoding),
+              mmal_4cc_to_string (encoding_variant, sizeof (encoding_variant),
+                  format->encoding_variant));
+        }
 
         /* push data to output pad */
         flow_ret = gst_pad_push (self->src_pad, gstbuf);
@@ -1209,7 +1213,7 @@ gst_mmal_deinterlace_output_task_loop (GstMMALDeinterlace * self)
 
         /* Input side will be waiting on condvar in drain() */
 
-        GST_DEBUG_OBJECT (self, "Drained");
+        GST_DEBUG_OBJECT (self, "Drained.");
         self->draining = FALSE;
         g_cond_broadcast (&self->drain_cond);
         flow_ret = GST_FLOW_OK;
@@ -1222,7 +1226,7 @@ gst_mmal_deinterlace_output_task_loop (GstMMALDeinterlace * self)
         gst_pad_pause_task (self->src_pad);
       } else {
 
-        GST_DEBUG_OBJECT (self, "EOS seen on output thread");
+        GST_DEBUG_OBJECT (self, "EOS seen on output thread.");
       }
 
       g_mutex_unlock (&self->drain_lock);
@@ -1339,7 +1343,7 @@ gst_mmal_deinterlace_alloc_output_gst_pool (GstMMALDeinterlace * self,
   g_return_val_if_fail (self != NULL, FALSE);
   g_return_val_if_fail (query != NULL, FALSE);
 
-  GST_DEBUG_OBJECT (self, "Creating new MMAL Opaque buffer pool...");
+  GST_DEBUG_OBJECT (self, "Creating new output buffer pool...");
 
   gst_video_info_init (&vinfo);
   gst_query_parse_allocation (query, &caps, NULL);
@@ -1450,11 +1454,11 @@ gst_mmal_deinterlace_alloc_output_gst_pool (GstMMALDeinterlace * self,
   gst_query_add_allocation_pool (query, pool, size, min_buffers, max_buffers);
 
   if (!gst_buffer_pool_set_active (pool, TRUE)) {
-    GST_ERROR_OBJECT (self, "Failed to activate MMAL Opaque buffer pool");
+    GST_ERROR_OBJECT (self, "Failed to activate output buffer pool.");
     return FALSE;
   }
 
-  GST_DEBUG_OBJECT (self, "MMAL Opaque buffer pool done.");
+  GST_DEBUG_OBJECT (self, "Output buffer pool done.");
 
   return TRUE;
 }
@@ -1536,7 +1540,7 @@ gst_mmal_deinterlace_open (GstMMALDeinterlace * self)
   g_return_val_if_fail (self != NULL, FALSE);
   g_return_val_if_fail (self->image_fx == NULL, TRUE);  /* already opened */
 
-  GST_DEBUG_OBJECT (self, "Opening deinterlacer");
+  GST_DEBUG_OBJECT (self, "Opening deinterlacer...");
 
   bcm_host_init ();
 
@@ -1547,8 +1551,9 @@ gst_mmal_deinterlace_open (GstMMALDeinterlace * self)
   status =
       mmal_component_create (MMAL_COMPONENT_DEFAULT_IMAGE_FX, &self->image_fx);
   if (status != MMAL_SUCCESS) {
-    GST_ERROR_OBJECT (self, "Failed to create MMAL image_fx component: %s (%u)",
-        mmal_status_to_string (status), status);
+    GST_ERROR_OBJECT (self, "Failed to create MMAL %s component: %s (%u)",
+        MMAL_COMPONENT_DEFAULT_IMAGE_FX, mmal_status_to_string (status),
+        status);
     return FALSE;
   }
 
@@ -1572,7 +1577,7 @@ gst_mmal_deinterlace_open (GstMMALDeinterlace * self)
     return FALSE;
   }
 
-  GST_DEBUG_OBJECT (self, "Opened deinterlacer");
+  GST_DEBUG_OBJECT (self, "Opened deinterlacer.");
 
   return TRUE;
 }
@@ -1584,7 +1589,7 @@ gst_mmal_deinterlace_close (GstMMALDeinterlace * self)
   g_return_val_if_fail (self != NULL, FALSE);
   g_return_val_if_fail (self->image_fx != NULL, TRUE);  /* already closed */
 
-  GST_DEBUG_OBJECT (self, "Closing deinterlacer");
+  GST_DEBUG_OBJECT (self, "Closing deinterlacer...");
 
   if (self->image_fx->control != NULL && self->image_fx->control->is_enabled) {
     mmal_port_disable (self->image_fx->control);
@@ -1621,7 +1626,7 @@ gst_mmal_deinterlace_close (GstMMALDeinterlace * self)
 
   self->image_fx = NULL;
 
-  GST_DEBUG_OBJECT (self, "Closed deinterlacer");
+  GST_DEBUG_OBJECT (self, "Closed deinterlacer.");
 
   return TRUE;
 }
@@ -1629,7 +1634,7 @@ gst_mmal_deinterlace_close (GstMMALDeinterlace * self)
 static gboolean
 gst_mmal_deinterlace_start (GstMMALDeinterlace * self)
 {
-  GST_DEBUG_OBJECT (self, "Start");
+  GST_DEBUG_OBJECT (self, "Starting deinterlacer...");
 
   self->last_upstream_ts = 0;
 
@@ -1653,13 +1658,15 @@ gst_mmal_deinterlace_start (GstMMALDeinterlace * self)
 
   GST_MMAL_DEINTERLACE_STREAM_LOCK (self);
 
+  GST_DEBUG_OBJECT (self, "Started deinterlacer.");
+
   return TRUE;
 }
 
 static gboolean
 gst_mmal_deinterlace_stop (GstMMALDeinterlace * self)
 {
-  GST_DEBUG_OBJECT (self, "Stopping deinterlacer");
+  GST_DEBUG_OBJECT (self, "Stopping deinterlacer...");
 
   gst_mmal_deinterlace_flush_stop (self, TRUE);
 
@@ -1683,7 +1690,7 @@ gst_mmal_deinterlace_stop (GstMMALDeinterlace * self)
 
   GST_PAD_STREAM_UNLOCK (self->src_pad);
 
-  GST_DEBUG_OBJECT (self, "Stopped deinterlacer");
+  GST_DEBUG_OBJECT (self, "Stopped deinterlacer.");
 
   return TRUE;
 }
@@ -1699,7 +1706,7 @@ gst_mmal_deinterlace_flush_start (GstMMALDeinterlace * self, gboolean stop)
   MMAL_STATUS_T status;
 
   gboolean started = self->started;
-  GstClockTime pts = GST_TIME_AS_USECONDS (self->last_upstream_ts);
+  GstClockTime pts = self->last_upstream_ts;
 
   gboolean ret = FALSE;
 
@@ -1721,7 +1728,7 @@ gst_mmal_deinterlace_flush_start (GstMMALDeinterlace * self, gboolean stop)
   }
 
   g_mutex_lock (&self->drain_lock);
-  GST_DEBUG_OBJECT (self, "Flushing: signalling drain done");
+  GST_DEBUG_OBJECT (self, "Flushing: signalling drain done.");
   self->draining = FALSE;
   g_cond_broadcast (&self->drain_cond);
   g_mutex_unlock (&self->drain_lock);
@@ -1749,17 +1756,16 @@ gst_mmal_deinterlace_flush_start (GstMMALDeinterlace * self, gboolean stop)
       goto done;
     }
 
-    GST_DEBUG_OBJECT (self, "Got input buffer");
+    GST_DEBUG_OBJECT (self, "Got input buffer.");
 
     /* "Resets all variables to default values" */
     mmal_buffer_header_reset (buffer);
     buffer->cmd = 0;
     buffer->flags |= MMAL_BUFFER_HEADER_FLAG_USER0;
-    buffer->pts = pts;
+    buffer->pts = GST_TIME_AS_USECONDS (pts);
 
-    GST_DEBUG_OBJECT (self,
-        "Sending wakeup buffer with pts: %" G_GUINT64_FORMAT,
-        (guint64) buffer->pts);
+    GST_DEBUG_OBJECT (self, "Sending wakeup buffer with PTS: %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (pts));
 
     if (mmal_port_send_buffer (self->image_fx->input[0], buffer) !=
         MMAL_SUCCESS) {
@@ -1916,7 +1922,7 @@ gst_mmal_deinterlace_ports_enable (GstMMALDeinterlace * self)
   g_return_val_if_fail (self->image_fx->input[0] != NULL, FALSE);
   g_return_val_if_fail (self->image_fx->output[0] != NULL, FALSE);
 
-  GST_DEBUG_OBJECT (self, "Enable deinterlacer ports");
+  GST_DEBUG_OBJECT (self, "Enabling deinterlacer ports...");
 
   input_port = self->image_fx->input[0];
   output_port = self->image_fx->output[0];
@@ -1949,7 +1955,7 @@ gst_mmal_deinterlace_ports_disable (GstMMALDeinterlace * self)
   g_return_val_if_fail (self->image_fx->input[0] != NULL, FALSE);
   g_return_val_if_fail (self->image_fx->output[0] != NULL, FALSE);
 
-  GST_DEBUG_OBJECT (self, "Disable deinterlacer ports");
+  GST_DEBUG_OBJECT (self, "Disabling deinterlacer ports...");
 
   input_port = self->image_fx->input[0];
   output_port = self->image_fx->output[0];
@@ -1990,7 +1996,7 @@ gst_mmal_deinterlace_setup_image_fx (GstMMALDeinterlace * self)
   g_return_val_if_fail (self->image_fx->input[0]->format != NULL, FALSE);
   g_return_val_if_fail (self->image_fx->output[0]->format != NULL, FALSE);
 
-  GST_DEBUG_OBJECT (self, "Setup deinterlacer ports");
+  GST_DEBUG_OBJECT (self, "Setting up deinterlacer ports...");
 
   input_port = self->image_fx->input[0];
   output_port = self->image_fx->output[0];
@@ -2006,7 +2012,7 @@ gst_mmal_deinterlace_setup_image_fx (GstMMALDeinterlace * self)
   gst_mmal_deinterlace_flush_image_fx (self);
 
 
-  GST_DEBUG_OBJECT (self, "Setting up input port format");
+  GST_DEBUG_OBJECT (self, "Setting up input port format...");
 
   input_format->es->video.crop.x = 0;
   input_format->es->video.crop.y = 0;
@@ -2042,7 +2048,7 @@ gst_mmal_deinterlace_setup_image_fx (GstMMALDeinterlace * self)
     return FALSE;
   }
 
-  GST_DEBUG_OBJECT (self, "buffers recommended (in): %u",
+  GST_DEBUG_OBJECT (self, "Buffers recommended (in): %u",
       input_port->buffer_num_recommended);
 
   input_port->buffer_num = GST_MMAL_NUM_OUTPUT_BUFFERS;
@@ -2066,7 +2072,7 @@ gst_mmal_deinterlace_setup_image_fx (GstMMALDeinterlace * self)
 
     while ((buffer = mmal_queue_get (self->output_queue))) {
 
-      GST_DEBUG_OBJECT (self, "Freeing output buffer %p", buffer);
+      GST_DEBUG_OBJECT (self, "Freeing output buffer: %p", buffer);
       mmal_buffer_header_release (buffer);
     }
 
@@ -2087,7 +2093,7 @@ gst_mmal_deinterlace_setup_image_fx (GstMMALDeinterlace * self)
    */
   output_format->es->video.frame_rate.num = self->video_info.fps_n * 2;
 
-  GST_DEBUG_OBJECT (self, "buffers recommended (out): %u",
+  GST_DEBUG_OBJECT (self, "Buffers recommended (out): %u",
       output_port->buffer_num_recommended);
 
   output_port->buffer_num = GST_MMAL_NUM_OUTPUT_BUFFERS;
@@ -2137,7 +2143,7 @@ gst_mmal_deinterlace_setup_image_fx (GstMMALDeinterlace * self)
     goto error_output_locked;
   }
 
-  GST_DEBUG_OBJECT (self, "Deinterlacer input & output configuration OK.");
+  GST_DEBUG_OBJECT (self, "Deinterlacer input/output configuration: done.");
 
   if (!gst_mmal_deinterlace_populate_output_port (self)) {
     goto error_output_locked;

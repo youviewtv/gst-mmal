@@ -356,14 +356,15 @@ gst_mmal_control_port_cb (MMAL_PORT_T * port, MMAL_BUFFER_HEADER_T * buffer)
   g_return_if_fail (buffer != NULL);
 
   self = GST_MMAL_VIDEO_SINK (port->userdata);
-  GST_TRACE_OBJECT (self, "control port callback");
+  GST_TRACE_OBJECT (self, "control port callback on %s", port->name);
 
   if (buffer->cmd == MMAL_EVENT_ERROR) {
     status = *(uint32_t *) buffer->data;
-    GST_ERROR_OBJECT (self, "MMAL error: %s (%u)",
-        mmal_status_to_string (status), status);
+    GST_ERROR_OBJECT (self, "MMAL error on control port %s: %s (%u)",
+        port->name, mmal_status_to_string (status), status);
   } else {
-    GST_DEBUG_OBJECT (self, "MMAL event on control port: %d", buffer->cmd);
+    GST_DEBUG_OBJECT (self, "MMAL event on control port %s: %d", port->name,
+        buffer->cmd);
   }
 
   mmal_buffer_header_release (buffer);
@@ -392,10 +393,11 @@ gst_mmal_input_port_cb (MMAL_PORT_T * port, MMAL_BUFFER_HEADER_T * buffer)
   g_return_if_fail (buffer != NULL);
 
   self = GST_MMAL_VIDEO_SINK (port->userdata);
-  GST_TRACE_OBJECT (self, "input port callback on %s", port->name);
+  GST_TRACE_OBJECT (self, "Input port callback on %s (buffer %p)", port->name,
+      buffer);
 
   if (buffer->cmd != 0) {
-    GST_DEBUG_OBJECT (self, "input port event: %u", buffer->cmd);
+    GST_DEBUG_OBJECT (self, "Input port event: %u", buffer->cmd);
   } else {
 
     MappedBuffer *mb = (MappedBuffer *) buffer->user_data;
@@ -427,7 +429,7 @@ gst_mmal_connection_cb (MMAL_CONNECTION_T * connection)
 
   self = GST_MMAL_VIDEO_SINK (connection->user_data);
 
-  GST_DEBUG_OBJECT (self, "connection callback %s", connection->name);
+  GST_DEBUG_OBJECT (self, "Connection callback: %s", connection->name);
 }
 
 static void
@@ -515,7 +517,7 @@ gst_mmal_video_sink_set_property (GObject * object, guint prop_id,
           GST_ERROR_OBJECT (self, "Failed to set render rectangle");
         }
       } else {
-        GST_WARNING_OBJECT (object, "Invalid destination window");
+        GST_WARNING_OBJECT (object, "Invalid destination window!");
       }
 
       break;
@@ -756,10 +758,10 @@ gst_mmal_video_sink_set_caps (GstBaseSink * sink, GstCaps * caps)
   g_return_val_if_fail (sink != NULL, FALSE);
 
   self = GST_MMAL_VIDEO_SINK (sink);
-  GST_DEBUG_OBJECT (self, "set caps: %" GST_PTR_FORMAT, caps);
+  GST_DEBUG_OBJECT (self, "Set caps: %" GST_PTR_FORMAT, caps);
 
   if (!gst_video_info_from_caps (&vinfo, caps)) {
-    GST_ERROR_OBJECT (self, "Could not turn caps into video info");
+    GST_ERROR_OBJECT (self, "Could not turn caps into video info!");
     return FALSE;
   }
 
@@ -777,8 +779,8 @@ gst_mmal_video_sink_set_caps (GstBaseSink * sink, GstCaps * caps)
 
   if (opaque_caps != self->opaque) {
     GST_DEBUG_OBJECT (self, "Caps indicate a change of buffer type. "
-        "Was %s, now %s", (self->opaque ? "Opaque" : "Plain"),
-        (opaque_caps ? "Opaque" : "Plain"));
+        "Was %s, now %s", (self->opaque ? "opaque" : "plain"),
+        (opaque_caps ? "opaque" : "plain"));
   }
 
   if (opaque_caps == self->opaque && gst_video_info_is_equal (&vinfo,
@@ -832,7 +834,7 @@ gst_mmal_video_sink_start (GstBaseSink * sink)
   g_return_val_if_fail (sink != NULL, FALSE);
 
   self = GST_MMAL_VIDEO_SINK (sink);
-  GST_DEBUG_OBJECT (self, "start");
+  GST_DEBUG_OBJECT (self, "Starting sink...");
 
   gst_video_info_init (&self->vinfo);
 
@@ -863,7 +865,7 @@ gst_mmal_video_sink_start (GstBaseSink * sink)
   self->started = TRUE;
 
   if (!gst_mmal_video_sink_set_render_rectangle (self)) {
-    GST_ERROR_OBJECT (self, "Failed to set render rectangle");
+    GST_ERROR_OBJECT (self, "Failed to set render rectangle!");
     return FALSE;
   }
 
@@ -883,7 +885,7 @@ gst_mmal_video_sink_stop (GstBaseSink * sink)
   g_return_val_if_fail (sink != NULL, FALSE);
 
   self = GST_MMAL_VIDEO_SINK (sink);
-  GST_DEBUG_OBJECT (self, "stop");
+  GST_DEBUG_OBJECT (self, "Stopping sink...");
 
   self->started = FALSE;
 
@@ -925,6 +927,8 @@ gst_mmal_video_sink_stop (GstBaseSink * sink)
   }
 
   g_clear_object (&self->allocator);
+
+  GST_DEBUG_OBJECT (self, "Stopped sink.");
 
   return TRUE;
 }
@@ -1230,7 +1234,7 @@ gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self)
   input = self->scheduler->input[0];
   g_return_val_if_fail (input != NULL, FALSE);
 
-  GST_DEBUG_OBJECT (self, "buffers recommended: %u",
+  GST_DEBUG_OBJECT (self, "Buffers recommended: %u",
       input->buffer_num_recommended);
 
   input->buffer_num = self->opaque ?
@@ -1243,7 +1247,8 @@ gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self)
    */
   if (self->opaque) {
     if (self->pool != NULL) {
-      GST_DEBUG_OBJECT (self, "Switching to opaque buffers, destroying pool");
+      GST_DEBUG_OBJECT (self,
+          "Switching to opaque buffers, destroying pool...");
       mmal_port_pool_destroy (input, self->pool);
       self->pool = NULL;
     }
@@ -1461,7 +1466,7 @@ gst_mmal_video_sink_set_render_rectangle (GstMMALVideoSink * self)
     return FALSE;
   }
 
-  GST_DEBUG_OBJECT (self, "video window: x=%f y=%f w=%f h=%f",
+  GST_DEBUG_OBJECT (self, "Video window: x=%f y=%f w=%f h=%f",
       self->window.x, self->window.y, self->window.width, self->window.height);
 
   display_region.hdr.id = MMAL_PARAMETER_DISPLAYREGION;
@@ -1476,7 +1481,7 @@ gst_mmal_video_sink_set_render_rectangle (GstMMALVideoSink * self)
   display_region.dest_rect.height = height;
 
   gst_mmal_scale_rect (&self->window, &display_region.dest_rect);
-  GST_DEBUG_OBJECT (self, "render rectangle: x=%d y=%d w=%d h=%d",
+  GST_DEBUG_OBJECT (self, "Render rectangle: x=%d y=%d w=%d h=%d",
       display_region.dest_rect.x, display_region.dest_rect.y,
       display_region.dest_rect.width, display_region.dest_rect.height);
 

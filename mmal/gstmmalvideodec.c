@@ -37,8 +37,6 @@
 GST_DEBUG_CATEGORY_STATIC (gst_mmal_video_dec_debug_category);
 #define GST_CAT_DEFAULT gst_mmal_video_dec_debug_category
 
-#define GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFER_HEADERS 3
-
 #define GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFERS_OPAQUE_MODE 20
 
 #define GST_MMAL_VIDEO_DEC_INPUT_BUFFER_WAIT_FOR_MS 2000
@@ -1744,8 +1742,6 @@ gst_mmal_video_dec_output_reconfigure_output_port (GstMMALVideoDec * self,
       return GST_FLOW_ERROR;
     }
 
-    output_port->buffer_num = GST_MMAL_NUM_OUTPUT_BUFFERS_OPAQUE_MODE;
-
   } else {
 
     output_format->encoding = MMAL_ENCODING_I420;
@@ -1754,10 +1750,9 @@ gst_mmal_video_dec_output_reconfigure_output_port (GstMMALVideoDec * self,
       GST_ERROR_OBJECT (self, "Failed to commit output port format.");
       return GST_FLOW_ERROR;
     }
-
-    output_port->buffer_num = output_port->buffer_num_recommended +
-        GST_MMAL_VIDEO_DEC_EXTRA_OUTPUT_BUFFER_HEADERS;
   }
+
+  output_port->buffer_num = GST_MMAL_NUM_OUTPUT_BUFFERS;
 
   /*
      NOTE: We can also receive notification of output port format changes via
@@ -1765,7 +1760,7 @@ gst_mmal_video_dec_output_reconfigure_output_port (GstMMALVideoDec * self,
      I'm also dealing with the output port here.
    */
 
-  output_port->buffer_size = output_port->buffer_size_recommended;
+  output_port->buffer_size = GST_MMAL_MAX_I420_BUFFER_SIZE;
 
   {
     MMAL_BUFFER_HEADER_T *buffer;
@@ -1788,12 +1783,10 @@ gst_mmal_video_dec_output_reconfigure_output_port (GstMMALVideoDec * self,
 
   GST_DEBUG_OBJECT (self, "Reconfiguring output buffer pool...");
 
-  if (self->output_buffer_pool != NULL) {
-    mmal_port_pool_destroy (output_port, self->output_buffer_pool);
+  if (!self->output_buffer_pool) {
+    self->output_buffer_pool = mmal_port_pool_create (output_port,
+        GST_MMAL_NUM_OUTPUT_BUFFERS, GST_MMAL_MAX_I420_BUFFER_SIZE);
   }
-
-  self->output_buffer_pool = mmal_port_pool_create (output_port,
-      output_port->buffer_num, output_port->buffer_size);
 
   if (mmal_port_enable (output_port,
           &gst_mmal_video_dec_mmal_queue_decoded_frame) != MMAL_SUCCESS) {

@@ -36,10 +36,6 @@
 #include <interface/mmal/util/mmal_util_params.h>
 #include <interface/vmcs_host/vc_tvservice.h>
 
-#define MMAL_I420_STRIDE_ALIGN 32
-#define MMAL_I420_WIDTH_ALIGN GST_ROUND_UP_32
-#define MMAL_I420_HEIGHT_ALIGN GST_ROUND_UP_16
-
 #define MMAL_BUFFER_NUM 3
 
 /*
@@ -47,15 +43,6 @@
  */
 #define MIN_VIDEO_WIDTH_FRACT (1.0 / 8.0)
 #define MIN_VIDEO_HEIGHT_FRACT (1.0 / 8.0)
-
-#define MAX_VIDEO_WIDTH 1920
-#define MAX_VIDEO_HEIGHT 1080
-
-#define MAX_I420_RES \
-    (MMAL_I420_WIDTH_ALIGN (MAX_VIDEO_WIDTH) * \
-     MMAL_I420_HEIGHT_ALIGN (MAX_VIDEO_HEIGHT))
-
-#define MAX_I420_BUFFER_SIZE ((3 * MAX_I420_RES) / 2)
 
 #define GST_MMAL_VIDEO_SINK(obj) \
   (G_TYPE_CHECK_INSTANCE_CAST((obj), GST_TYPE_MMAL_VIDEO_SINK, GstMMALVideoSink))
@@ -488,9 +475,9 @@ gst_mmal_video_sink_set_format (MMAL_ES_FORMAT_T * format, GstVideoInfo * vinfo,
   format->es->video.crop.width = GST_VIDEO_INFO_WIDTH (vinfo);
   format->es->video.crop.height = GST_VIDEO_INFO_HEIGHT (vinfo);
   format->es->video.width =
-      MMAL_I420_WIDTH_ALIGN (GST_VIDEO_INFO_WIDTH (vinfo));
+      GST_MMAL_I420_WIDTH_ALIGN (GST_VIDEO_INFO_WIDTH (vinfo));
   format->es->video.height =
-      MMAL_I420_HEIGHT_ALIGN (GST_VIDEO_INFO_HEIGHT (vinfo));
+      GST_MMAL_I420_HEIGHT_ALIGN (GST_VIDEO_INFO_HEIGHT (vinfo));
   format->es->video.frame_rate.num = GST_VIDEO_INFO_FPS_N (vinfo);
   format->es->video.frame_rate.den = GST_VIDEO_INFO_FPS_D (vinfo);
   format->es->video.par.num = GST_VIDEO_INFO_PAR_N (vinfo);
@@ -584,15 +571,15 @@ gst_mmal_video_sink_set_caps (GstBaseSink * sink, GstCaps * caps)
   gst_video_alignment_reset (&align);
 
   align.padding_bottom =
-      MMAL_I420_HEIGHT_ALIGN (GST_VIDEO_INFO_HEIGHT (&vinfo)) -
+      GST_MMAL_I420_HEIGHT_ALIGN (GST_VIDEO_INFO_HEIGHT (&vinfo)) -
       GST_VIDEO_INFO_HEIGHT (&vinfo);
   align.padding_right =
-      MMAL_I420_WIDTH_ALIGN (GST_VIDEO_INFO_WIDTH (&vinfo)) -
+      GST_MMAL_I420_WIDTH_ALIGN (GST_VIDEO_INFO_WIDTH (&vinfo)) -
       GST_VIDEO_INFO_WIDTH (&vinfo);
 
-  align.stride_align[0] = MMAL_I420_STRIDE_ALIGN - 1;
-  align.stride_align[1] = (MMAL_I420_STRIDE_ALIGN / 2) - 1;
-  align.stride_align[2] = (MMAL_I420_STRIDE_ALIGN / 2) - 1;
+  align.stride_align[0] = GST_MMAL_I420_STRIDE_ALIGN - 1;
+  align.stride_align[1] = (GST_MMAL_I420_STRIDE_ALIGN / 2) - 1;
+  align.stride_align[2] = (GST_MMAL_I420_STRIDE_ALIGN / 2) - 1;
 
   gst_video_info_align (&vinfo, &align);
   if (!gst_video_info_is_equal (&vinfo, &self->vinfo)) {
@@ -880,8 +867,8 @@ gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self)
       input->buffer_num_recommended);
 
   input->buffer_num = self->opaque ?
-      GST_MMAL_NUM_OUTPUT_BUFFERS_OPAQUE_MODE : MMAL_BUFFER_NUM;
-  input->buffer_size = MAX_I420_BUFFER_SIZE;
+      GST_MMAL_NUM_OUTPUT_BUFFERS : MMAL_BUFFER_NUM;
+  input->buffer_size = GST_MMAL_MAX_I420_BUFFER_SIZE;
 
   /* In opaque case we don't need any pool, but it's possible that we're
      switching from opaque to plain buffers, in which case we should destroy
@@ -911,11 +898,11 @@ gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self)
   if (self->pool == NULL) {
     GST_DEBUG_OBJECT (self, "Creating input pool...");
     self->pool = mmal_port_pool_create (input, MMAL_BUFFER_NUM,
-        MAX_I420_BUFFER_SIZE);
+        GST_MMAL_MAX_I420_BUFFER_SIZE);
   }
 
   if (!self->pool) {
-    GST_ERROR_OBJECT (self, "Failer to create port buffer pool");
+    GST_ERROR_OBJECT (self, "Failed to create port buffer pool");
     return FALSE;
   }
 

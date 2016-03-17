@@ -30,6 +30,20 @@
 
 G_BEGIN_DECLS
 
+#define GST_MMAL_I420_STRIDE_ALIGN 32
+
+#define GST_MMAL_I420_WIDTH_ALIGN GST_ROUND_UP_32
+#define GST_MMAL_I420_HEIGHT_ALIGN GST_ROUND_UP_16
+
+#define GST_MMAL_MAX_VIDEO_WIDTH 1920
+#define GST_MMAL_MAX_VIDEO_HEIGHT 1080
+
+#define GST_MMAL_MAX_I420_RES \
+    (GST_MMAL_I420_WIDTH_ALIGN (GST_MMAL_MAX_VIDEO_WIDTH) * \
+     GST_MMAL_I420_HEIGHT_ALIGN (GST_MMAL_MAX_VIDEO_HEIGHT))
+
+#define GST_MMAL_MAX_I420_BUFFER_SIZE ((3 * GST_MMAL_MAX_I420_RES) / 2)
+
 /* Since we use upstream buffer allocation, components must agree on the number
    of buffers used between them.  This is dictated by the requirement that the
    number of buffers sent to MMAL port must not exceed the number of buffer
@@ -38,8 +52,11 @@ G_BEGIN_DECLS
 
    If the number of buffers sent to the port exceeds `buffer_num`, we get
    ENOMEM.
+
+   Another reason to have this number defined upfront is to avoid reallocating
+   pools which in some scenarios (media format change) is onerous.
  */
-#define GST_MMAL_NUM_OUTPUT_BUFFERS_OPAQUE_MODE 20
+#define GST_MMAL_NUM_OUTPUT_BUFFERS 20
 
 /* --- MMAL OPAQUE MEMORY --- */
 

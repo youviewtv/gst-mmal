@@ -1986,7 +1986,7 @@ gst_mmal_deinterlace_setup_image_fx (GstMMALDeinterlace * self)
   GST_DEBUG_OBJECT (self, "buffers recommended (in): %u",
       input_port->buffer_num_recommended);
 
-  input_port->buffer_num = GST_MMAL_NUM_OUTPUT_BUFFERS_OPAQUE_MODE;
+  input_port->buffer_num = GST_MMAL_NUM_OUTPUT_BUFFERS;
   input_port->buffer_size = input_port->buffer_size_recommended;
 
   input_port->userdata = (void *) self;
@@ -2020,10 +2020,6 @@ gst_mmal_deinterlace_setup_image_fx (GstMMALDeinterlace * self)
      I'm also dealing with the output port here.
    */
 
-  if (self->output_buffer_pool != NULL) {
-    mmal_port_pool_destroy (output_port, self->output_buffer_pool);
-  }
-
   mmal_format_full_copy (output_format, input_format);
   /* Deinterlacer doubles the frame rate on the output.  Not sure if frame rate
    * configuration is respected in the output port format or whether the
@@ -2035,7 +2031,7 @@ gst_mmal_deinterlace_setup_image_fx (GstMMALDeinterlace * self)
   GST_DEBUG_OBJECT (self, "buffers recommended (out): %u",
       output_port->buffer_num_recommended);
 
-  output_port->buffer_num = GST_MMAL_NUM_OUTPUT_BUFFERS_OPAQUE_MODE;
+  output_port->buffer_num = GST_MMAL_NUM_OUTPUT_BUFFERS;
   output_port->buffer_size = input_port->buffer_size;
 
   if (mmal_port_parameter_set_boolean (output_port, MMAL_PARAMETER_ZERO_COPY,
@@ -2050,14 +2046,16 @@ gst_mmal_deinterlace_setup_image_fx (GstMMALDeinterlace * self)
     goto error_output_locked;
   }
 
-  GST_DEBUG_OBJECT (self, "Reconfiguring output buffer pool...");
+  if (!self->output_buffer_pool) {
+    GST_DEBUG_OBJECT (self, "Reconfiguring output buffer pool...");
 
-  self->output_buffer_pool = mmal_port_pool_create (output_port,
-      output_port->buffer_num, output_port->buffer_size);
+    self->output_buffer_pool = mmal_port_pool_create (output_port,
+        output_port->buffer_num, output_port->buffer_size);
 
-  if (self->output_buffer_pool == NULL) {
-    GST_ERROR_OBJECT (self, "Failed to create output buffer pool!");
-    goto error_output_locked;
+    if (self->output_buffer_pool == NULL) {
+      GST_ERROR_OBJECT (self, "Failed to create output buffer pool!");
+      goto error_output_locked;
+    }
   }
 
   self->output_queue = mmal_queue_create ();

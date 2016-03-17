@@ -1675,8 +1675,11 @@ gst_mmal_deinterlace_stop (GstMMALDeinterlace * self)
 
   GST_PAD_STREAM_LOCK (self->src_pad);
 
-  gst_buffer_pool_set_active (self->output_gstpool, FALSE);
-  gst_object_replace ((GstObject **) & self->output_gstpool, NULL);
+  if (self->output_gstpool != NULL) {
+    gst_buffer_pool_set_active (self->output_gstpool, FALSE);
+    gst_object_unref (self->output_gstpool);
+    self->output_gstpool = NULL;
+  }
 
   GST_PAD_STREAM_UNLOCK (self->src_pad);
 

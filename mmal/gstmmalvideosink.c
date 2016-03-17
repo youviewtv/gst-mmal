@@ -164,6 +164,8 @@ static void gst_mmal_video_sink_get_property (GObject * object, guint prop_id,
 static void gst_mmal_video_sink_set_property (GObject * object, guint prop_id,
     const GValue * value, GParamSpec * pspec);
 
+static GstClock *gst_mmal_video_sink_provide_clock (GstElement * element);
+
 static gboolean gst_mmal_video_sink_set_caps (GstBaseSink * sink,
     GstCaps * caps);
 
@@ -225,6 +227,9 @@ gst_mmal_video_sink_class_init (GstMMALVideoSinkClass * klass)
 
   GST_DEBUG_CATEGORY_INIT (mmalvideosink_debug, "mmalvideosink", 0,
       "MMAL video sink element");
+
+  element_class->provide_clock =
+      GST_DEBUG_FUNCPTR (gst_mmal_video_sink_provide_clock);
 
   basesink_class->set_caps = GST_DEBUG_FUNCPTR (gst_mmal_video_sink_set_caps);
   basesink_class->start = GST_DEBUG_FUNCPTR (gst_mmal_video_sink_start);
@@ -573,6 +578,15 @@ gst_mmal_video_sink_connect_ports (GstMMALVideoSink * self,
   return connection;
 }
 
+static GstClock *
+gst_mmal_video_sink_provide_clock (GstElement * element)
+{
+  GstMMALVideoSink *self = GST_MMAL_VIDEO_SINK (element);
+
+  GST_DEBUG_OBJECT (self, "Providing clock: %p", self->clk);
+  return self->clk ? GST_CLOCK_CAST (gst_object_ref (self->clk)) : NULL;
+}
+
 static gboolean
 gst_mmal_video_sink_propose_allocation (GstBaseSink * sink, GstQuery * query)
 {
@@ -740,7 +754,9 @@ gst_mmal_video_sink_start (GstBaseSink * sink)
   /* Enable tvservice callback for proper display resolution update support */
   vc_tv_register_callback (gst_mmal_video_sink_tvservice_callback, self);
 
-  return gst_mmal_video_sink_enable_renderer (self);
+  return gst_mmal_video_sink_enable_renderer (self) &&
+      gst_element_post_message (GST_ELEMENT (self),
+      gst_message_new_clock_provide (GST_OBJECT (self), self->clk, TRUE));
 }
 
 static gboolean

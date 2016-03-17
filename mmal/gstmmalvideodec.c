@@ -362,7 +362,7 @@ gst_mmal_video_dec_start (GstVideoDecoder * decoder)
   self->output_buffer_flags = 0;
 
   self->decoded_frames_queue = mmal_queue_create ();
-  self->dec->output[0]->userdata = (void *) self->decoded_frames_queue;
+  self->dec->output[0]->userdata = (void *) self;
 
   GST_PAD_STREAM_UNLOCK (GST_VIDEO_DECODER_SRC_PAD (self));
 
@@ -474,6 +474,8 @@ gst_mmal_video_dec_mmal_return_input_buffer_to_pool (MMAL_PORT_T * port,
   g_return_if_fail (port != NULL);
   g_return_if_fail (buffer != NULL);
 
+  GST_TRACE_OBJECT (GST_ELEMENT (port->userdata), "Input port callback: %p",
+      buffer);
   /* We're using the GstBuffer directly, rather than copying into an MMAL
      allocated buffer.  So we need to unmap and unref the GstBuffer once the
      decoder is done with it.
@@ -535,8 +537,12 @@ static void
 gst_mmal_video_dec_mmal_queue_decoded_frame (MMAL_PORT_T * port,
     MMAL_BUFFER_HEADER_T * buffer)
 {
-  MMAL_QUEUE_T *queue = (MMAL_QUEUE_T *) port->userdata;
-  mmal_queue_put (queue, buffer);
+  GstMMALVideoDec *self = GST_MMAL_VIDEO_DEC (port->userdata);
+
+  GST_TRACE_OBJECT (self, "Queuing decoded buffer %p, PTS %" GST_TIME_FORMAT,
+      buffer, GST_TIME_ARGS (gst_util_uint64_scale (buffer->pts, GST_SECOND,
+              G_USEC_PER_SEC)));
+  mmal_queue_put (self->decoded_frames_queue, buffer);
 }
 
 
@@ -952,8 +958,8 @@ gst_mmal_video_dec_drain (GstMMALVideoDec * self)
 
     buffer->pts = GST_TIME_AS_USECONDS (self->last_upstream_ts);
 
-    GST_DEBUG_OBJECT (self, "Sending EOS with pts: %" G_GUINT64_FORMAT,
-        (guint64) buffer->pts);
+    GST_DEBUG_OBJECT (self, "Sending EOS with pts: %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (self->last_upstream_ts));
 
     /* Hold this mutex before sending EOS buffer, otherwise we have a race. */
     g_mutex_lock (&self->drain_lock);
@@ -1168,6 +1174,7 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
           sizeof (MappedBuffer));
     }
 
+    input_port->userdata = (void *) self;
     if (mmal_port_enable (input_port,
             &gst_mmal_video_dec_mmal_return_input_buffer_to_pool) !=
         MMAL_SUCCESS) {
@@ -1207,7 +1214,7 @@ gst_mmal_video_dec_flush_internal (GstVideoDecoder * decoder, gboolean stop)
   MMAL_BUFFER_HEADER_T *buffer = NULL;
   gboolean started = self->started;
 
-  GST_INFO_OBJECT (self, "flushing...");
+  GST_INFO_OBJECT (self, "Flushing...");
 
   if (!self->dec) {
     GST_ERROR_OBJECT (self, "Decoder component not yet created!");
@@ -1252,9 +1259,8 @@ gst_mmal_video_dec_flush_internal (GstVideoDecoder * decoder, gboolean stop)
 
     buffer->pts = GST_TIME_AS_USECONDS (self->last_upstream_ts);
 
-    GST_DEBUG_OBJECT (self,
-        "Sending wakeup buffer with pts: %" G_GUINT64_FORMAT,
-        (guint64) buffer->pts);
+    GST_DEBUG_OBJECT (self, "Sending wakeup buffer with PTS: %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (self->last_upstream_ts));
 
     if (mmal_port_send_buffer (self->dec->input[0], buffer) != MMAL_SUCCESS) {
 
@@ -1344,8 +1350,7 @@ gst_mmal_video_dec_flush_internal (GstVideoDecoder * decoder, gboolean stop)
          What we do expect though is that the decoder has released the buffers
          that it was holding onto itself.
        */
-      GST_DEBUG_OBJECT (self,
-          "Reclaimed output buffers (%d out of %d)",
+      GST_DEBUG_OBJECT (self, "Reclaimed output buffers (%d out of %d)",
           output_buffers, output_port->buffer_num);
     }
   }
@@ -1404,7 +1409,8 @@ gst_mmal_video_dec_output_clean_older_frames (GstMMALVideoDec * self,
   GstClockTime timestamp = gst_util_uint64_scale (buf->pts, GST_SECOND,
       G_USEC_PER_SEC);
 
-  GST_DEBUG_OBJECT (self, "Cleaning older than: %lli", timestamp);
+  GST_DEBUG_OBJECT (self, "Cleaning older than: %" GST_TIME_FORMAT,
+      GST_TIME_ARGS (timestamp));
 
   if (GST_CLOCK_TIME_IS_VALID (timestamp)) {
     /* We could release all frames stored with pts < timestamp since the
@@ -1777,7 +1783,7 @@ gst_mmal_video_dec_output_reconfigure_output_port (GstMMALVideoDec * self,
 
     GST_DEBUG_OBJECT (self, "Creating decoded frames queue...");
     self->decoded_frames_queue = mmal_queue_create ();
-    output_port->userdata = (void *) self->decoded_frames_queue;
+    output_port->userdata = (void *) self;
   }
 
   GST_DEBUG_OBJECT (self, "Reconfiguring output buffer pool...");
@@ -2109,7 +2115,9 @@ gst_mmal_video_dec_output_task_loop (GstMMALVideoDec * self)
 
             if (flow_ret == GST_FLOW_OK) {
 
-              GST_DEBUG_OBJECT (self, "Finishing frame...");
+              GST_DEBUG_OBJECT (self, "Finishing frame PTS %" GST_TIME_FORMAT,
+                  GST_TIME_ARGS (gst_util_uint64_scale (buffer->pts,
+                          GST_SECOND, G_USEC_PER_SEC)));
 
               flow_ret =
                   gst_video_decoder_finish_frame (GST_VIDEO_DECODER (self),
@@ -2336,7 +2344,8 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
 
   if (GST_CLOCK_TIME_IS_VALID (frame->pts)) {
 
-    GST_DEBUG_OBJECT (self, "PTS: %lli", frame->pts);
+    GST_DEBUG_OBJECT (self, "PTS: %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (frame->pts));
 
     pts_microsec = GST_TIME_AS_USECONDS (frame->pts);
 
@@ -2354,7 +2363,8 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
 
   if (GST_CLOCK_TIME_IS_VALID (frame->dts)) {
 
-    GST_DEBUG_OBJECT (self, "DTS: %lli", frame->dts);
+    GST_DEBUG_OBJECT (self, "DTS: %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (frame->dts));
 
     dts_microsec = GST_TIME_AS_USECONDS (frame->dts);
 
@@ -2461,6 +2471,9 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
     }
 
     /* Now send the buffer to decoder. */
+
+    GST_TRACE_OBJECT (self, "Sending MMAL buffer %p, flags 0x%x",
+        mmal_buffer, mmal_buffer->flags);
 
     if (mmal_port_send_buffer (self->dec->input[0], mmal_buffer) !=
         MMAL_SUCCESS) {

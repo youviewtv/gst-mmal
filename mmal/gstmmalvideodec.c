@@ -266,7 +266,7 @@ gst_mmal_video_dec_open (GstVideoDecoder * decoder)
 {
   GstMMALVideoDec *self = GST_MMAL_VIDEO_DEC (decoder);
 
-  GST_DEBUG_OBJECT (self, "Opening decoder");
+  GST_DEBUG_OBJECT (self, "Opening decoder...");
 
   bcm_host_init ();
 
@@ -291,7 +291,7 @@ gst_mmal_video_dec_open (GstVideoDecoder * decoder)
   self->started = FALSE;
   self->flushing = FALSE;
 
-  GST_DEBUG_OBJECT (self, "Opened decoder");
+  GST_DEBUG_OBJECT (self, "Opened decoder.");
 
   return TRUE;
 }
@@ -307,7 +307,7 @@ gst_mmal_video_dec_close (GstVideoDecoder * decoder)
 {
   GstMMALVideoDec *self = GST_MMAL_VIDEO_DEC (decoder);
 
-  GST_DEBUG_OBJECT (self, "Closing decoder");
+  GST_DEBUG_OBJECT (self, "Closing decoder...");
 
   if (self->dec->control->is_enabled
       && mmal_port_disable (self->dec->control) != MMAL_SUCCESS) {
@@ -322,14 +322,14 @@ gst_mmal_video_dec_close (GstVideoDecoder * decoder)
     return FALSE;
   }
 
-  GST_DEBUG_OBJECT (self, "Freeing decoded frames queue");
+  GST_DEBUG_OBJECT (self, "Freeing decoded frames queue...");
 
   if (self->decoded_frames_queue) {
     mmal_queue_destroy (self->decoded_frames_queue);
     self->decoded_frames_queue = NULL;
   }
 
-  GST_DEBUG_OBJECT (self, "Freeing output buffer pool");
+  GST_DEBUG_OBJECT (self, "Freeing output buffer pool...");
 
   if (self->output_buffer_pool_opaque != NULL) {
     uint32_t output_buffers;
@@ -358,7 +358,7 @@ gst_mmal_video_dec_close (GstVideoDecoder * decoder)
 
   self->dec = NULL;
 
-  GST_DEBUG_OBJECT (self, "Closed decoder");
+  GST_DEBUG_OBJECT (self, "Closed decoder.");
 
   return TRUE;
 }
@@ -411,7 +411,7 @@ gst_mmal_video_dec_start (GstVideoDecoder * decoder)
 {
   GstMMALVideoDec *self = GST_MMAL_VIDEO_DEC (decoder);
 
-  GST_DEBUG_OBJECT (self, "Start");
+  GST_DEBUG_OBJECT (self, "Starting decoder...");
 
   self->last_upstream_ts = 0;
 
@@ -454,7 +454,7 @@ gst_mmal_video_dec_stop (GstVideoDecoder * decoder)
 
   self = GST_MMAL_VIDEO_DEC (decoder);
 
-  GST_DEBUG_OBJECT (self, "Stopping decoder");
+  GST_DEBUG_OBJECT (self, "Stopping decoder...");
 
   /* Full flush will stop the output side. */
   gst_mmal_video_dec_flush_stop (self, TRUE);
@@ -468,7 +468,7 @@ gst_mmal_video_dec_stop (GstVideoDecoder * decoder)
     self->input_state = NULL;
   }
 
-  GST_DEBUG_OBJECT (self, "Disabling input port");
+  GST_DEBUG_OBJECT (self, "Disabling input port...");
 
   /* Disable ports and free-up buffer pools. */
   if (self->dec->input[0]->is_enabled &&
@@ -478,7 +478,7 @@ gst_mmal_video_dec_stop (GstVideoDecoder * decoder)
     success = FALSE;
   }
 
-  GST_DEBUG_OBJECT (self, "Freeing input buffer pool");
+  GST_DEBUG_OBJECT (self, "Freeing input buffer pool...");
 
   if (self->input_buffer_pool != NULL) {
     mmal_pool_destroy (self->input_buffer_pool);
@@ -487,7 +487,7 @@ gst_mmal_video_dec_stop (GstVideoDecoder * decoder)
 
   GST_PAD_STREAM_LOCK (GST_VIDEO_DECODER_SRC_PAD (self));
 
-  GST_DEBUG_OBJECT (self, "Disabling output port");
+  GST_DEBUG_OBJECT (self, "Disabling output port...");
 
   if (self->dec->output[0]->is_enabled &&
       mmal_port_disable (self->dec->output[0]) != MMAL_SUCCESS) {
@@ -500,7 +500,7 @@ gst_mmal_video_dec_stop (GstVideoDecoder * decoder)
 
   GST_PAD_STREAM_UNLOCK (GST_VIDEO_DECODER_SRC_PAD (self));
 
-  GST_DEBUG_OBJECT (self, "Stopped decoder");
+  GST_DEBUG_OBJECT (self, "Stopped decoder.");
 
   GST_VIDEO_DECODER_STREAM_UNLOCK (decoder);
 
@@ -710,7 +710,7 @@ gst_mmal_video_dec_output_decide_allocation (GstVideoDecoder * decoder,
     guint config_max_buffers;
     GstAllocationParams allocator_params;
 
-    GST_DEBUG_OBJECT (self, "Creating new MMAL Opaque buffer pool.");
+    GST_DEBUG_OBJECT (self, "Creating new output buffer pool...");
 
     gst_buffer_pool_config_get_params (config, &caps, &config_size,
         &config_min_buffers, &config_max_buffers);
@@ -994,7 +994,7 @@ gst_mmal_video_dec_drain (GstMMALVideoDec * self)
       goto no_input_buffer;
     }
 
-    GST_DEBUG_OBJECT (self, "Got input buffer");
+    GST_DEBUG_OBJECT (self, "Got input buffer.");
 
     /* "Resets all variables to default values" */
     mmal_buffer_header_reset (buffer);
@@ -1205,7 +1205,7 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
       return FALSE;
     }
 
-    GST_DEBUG_OBJECT (self, "buffers recommended (in): %u",
+    GST_DEBUG_OBJECT (self, "Buffers recommended (in): %u",
         input_port->buffer_num_recommended);
 
     input_port->buffer_num = input_port->buffer_num_recommended;
@@ -1323,7 +1323,7 @@ gst_mmal_video_dec_flush_start (GstMMALVideoDec * self, gboolean stop)
   }
 
   g_mutex_lock (&self->drain_lock);
-  GST_DEBUG_OBJECT (self, "Flushing: signalling drain done");
+  GST_DEBUG_OBJECT (self, "Flushing: signalling drain done.");
   self->draining = FALSE;
   g_cond_broadcast (&self->drain_cond);
   g_mutex_unlock (&self->drain_lock);
@@ -1351,7 +1351,7 @@ gst_mmal_video_dec_flush_start (GstMMALVideoDec * self, gboolean stop)
       goto done;
     }
 
-    GST_DEBUG_OBJECT (self, "Got input buffer");
+    GST_DEBUG_OBJECT (self, "Got input buffer.");
 
     /* "Resets all variables to default values" */
     mmal_buffer_header_reset (buffer);
@@ -1449,7 +1449,7 @@ gst_mmal_video_dec_flush_stop (GstMMALVideoDec * self, gboolean stop)
     /* Free any decoded frames */
     while ((buffer = mmal_queue_get (self->decoded_frames_queue))) {
 
-      GST_DEBUG_OBJECT (self, "Freeing decoded frame %p", buffer);
+      GST_DEBUG_OBJECT (self, "Freeing decoded frame: %p", buffer);
       mmal_buffer_header_release (buffer);
     }
   }
@@ -1818,7 +1818,7 @@ gst_mmal_video_dec_output_reconfigure_output_port (GstMMALVideoDec * self,
 
   output_format = output_port->format;
 
-  GST_DEBUG_OBJECT (self, "buffers recommended (out): %u",
+  GST_DEBUG_OBJECT (self, "Buffers recommended (out): %u",
       output_port->buffer_num_recommended);
 
   if (mmal_port_parameter_set_boolean (output_port, MMAL_PARAMETER_ZERO_COPY,
@@ -1876,7 +1876,7 @@ gst_mmal_video_dec_output_reconfigure_output_port (GstMMALVideoDec * self,
       /* Free any decoded frames */
       while ((buffer = mmal_queue_get (self->decoded_frames_queue))) {
 
-        GST_DEBUG_OBJECT (self, "Freeing decoded frame %p", buffer);
+        GST_DEBUG_OBJECT (self, "Freeing decoded frame: %p", buffer);
         mmal_buffer_header_release (buffer);
       }
 
@@ -2018,19 +2018,19 @@ gst_mmal_video_dec_output_task_loop (GstMMALVideoDec * self)
       switch (buffer->cmd) {
 
         case MMAL_EVENT_EOS:
-          GST_DEBUG_OBJECT (self, "Got EOS");
+          GST_DEBUG_OBJECT (self, "Got EOS.");
           flow_ret = GST_FLOW_EOS;
           break;
         case MMAL_EVENT_ERROR:
           /* TODO: Pull-out some useful info. */
-          GST_DEBUG_OBJECT (self, "TODO: Got Error");
+          GST_DEBUG_OBJECT (self, "TODO: Got error.");
           flow_ret = GST_FLOW_ERROR;
           break;
         case MMAL_EVENT_FORMAT_CHANGED:
           GST_DEBUG_OBJECT (self, "TODO: Output port format changed.");
           break;
         case MMAL_EVENT_PARAMETER_CHANGED:
-          GST_DEBUG_OBJECT (self, "TODO: Parameter changed");
+          GST_DEBUG_OBJECT (self, "TODO: Parameter changed.");
           break;
       }
 
@@ -2042,8 +2042,9 @@ gst_mmal_video_dec_output_task_loop (GstMMALVideoDec * self)
 
     } else {
 
-      GST_DEBUG_OBJECT (self, "Handling decoded frame: %" G_GUINT64_FORMAT,
-          (guint64) buffer->pts);
+      GST_DEBUG_OBJECT (self, "Handling decoded frame: %" GST_TIME_FORMAT,
+          GST_TIME_ARGS (gst_util_uint64_scale (buffer->pts, GST_SECOND,
+                  G_USEC_PER_SEC)));
 
       if ((buffer->flags & MMAL_BUFFER_HEADER_FLAG_EOS)) {
 
@@ -2105,8 +2106,8 @@ gst_mmal_video_dec_output_task_loop (GstMMALVideoDec * self)
             buffer = NULL;
 
             GST_WARNING_OBJECT (self, "Change in buffer type from %s to %s! "
-                "Trying to reconfigure...", (was_opaque ? "Opaque" : "Plain"),
-                (self->opaque ? "Opaque" : "Plain"));
+                "Trying to reconfigure...", (was_opaque ? "opaque" : "plain"),
+                (self->opaque ? "opaque" : "plain"));
 
             /* We do reconfigure again, but note that we don't go through
                downstream caps negotiation this time (that's what the FALSE is
@@ -2244,7 +2245,7 @@ gst_mmal_video_dec_output_task_loop (GstMMALVideoDec * self)
 
         /* Input side will be waiting on condvar in drain() */
 
-        GST_DEBUG_OBJECT (self, "Drained");
+        GST_DEBUG_OBJECT (self, "Drained.");
         self->draining = FALSE;
         g_cond_broadcast (&self->drain_cond);
         flow_ret = GST_FLOW_OK;
@@ -2258,7 +2259,7 @@ gst_mmal_video_dec_output_task_loop (GstMMALVideoDec * self)
         self->started = FALSE;
       } else {
 
-        GST_DEBUG_OBJECT (self, "EOS seen on output thread");
+        GST_DEBUG_OBJECT (self, "EOS seen on output thread.");
       }
 
       g_mutex_unlock (&self->drain_lock);
@@ -2316,7 +2317,7 @@ gst_mmal_video_dec_send_codec_data (GstMMALVideoDec * self,
     goto done;
   }
 
-  GST_DEBUG_OBJECT (self, "Got input MMAL buffer(%p) for codec data",
+  GST_DEBUG_OBJECT (self, "Got input MMAL buffer (%p) for codec data",
       mmal_buffer);
 
   /* "Resets all variables to default values" */
@@ -2354,14 +2355,14 @@ gst_mmal_video_dec_send_codec_data (GstMMALVideoDec * self,
   mmal_buffer->flags |= MMAL_BUFFER_HEADER_FLAG_CONFIG;
   mmal_buffer->flags |= MMAL_BUFFER_HEADER_FLAG_FRAME_END;
 
-  GST_DEBUG_OBJECT (self, "Sending codec data of size: %d to MMAL...",
+  GST_DEBUG_OBJECT (self, "Sending codec data of size %d to MMAL...",
       data_size);
 
   /* Now send the buffer to decoder. */
   if (mmal_port_send_buffer (input_port, mmal_buffer) != MMAL_SUCCESS) {
 
     GST_ERROR_OBJECT (self,
-        "Failed to send input buffer(%p) with codec data to decoder!",
+        "Failed to send input buffer (%p) with codec data to decoder!",
         mmal_buffer);
 
     gst_mmal_video_dec_mmal_return_input_buffer_to_pool (input_port,
@@ -2401,7 +2402,7 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
   /* Handle this input frame. */
 
   if (g_atomic_int_get (&self->flushing)) {
-    GST_DEBUG_OBJECT (self, "Flushing: not decoding input frame");
+    GST_DEBUG_OBJECT (self, "Flushing: not decoding input frame.");
     flow_ret = GST_FLOW_FLUSHING;
     goto done_locked;
   }
@@ -2517,10 +2518,10 @@ gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
       goto done;
     }
 
-    GST_DEBUG_OBJECT (self, "Got input MMAL buffer(%p)", mmal_buffer);
+    GST_DEBUG_OBJECT (self, "Got input MMAL buffer (%p)", mmal_buffer);
 
     if (g_atomic_int_get (&self->flushing)) {
-      GST_DEBUG_OBJECT (self, "Flushing: not decoding input frame");
+      GST_DEBUG_OBJECT (self, "Flushing: not decoding input frame.");
       mmal_buffer_header_release (mmal_buffer);
       flow_ret = GST_FLOW_FLUSHING;
       goto done;

@@ -23,6 +23,8 @@
 #endif
 
 #include "gstmmalvideosink.h"
+
+#include "gstmmalclock.h"
 #include "gstmmalmemory.h"
 
 #include <gst/video/video.h>
@@ -31,6 +33,7 @@
 #include <bcm_host.h>
 
 #include <interface/mmal/mmal.h>
+#include <interface/mmal/util/mmal_connection.h>
 #include <interface/mmal/util/mmal_util.h>
 #include <interface/mmal/util/mmal_default_components.h>
 #include <interface/mmal/util/mmal_util_params.h>
@@ -66,7 +69,13 @@ struct _GstMMALVideoSink
   GstVideoInfo vinfo;
   GstVideoInfo *vinfo_padded;
 
+  MMAL_COMPONENT_T *scheduler;
   MMAL_COMPONENT_T *renderer;
+
+  MMAL_CONNECTION_T *connection;
+
+  GstClock *clk;
+
   MMAL_POOL_T *pool;
 
   /* This is set on caps change.  It tells show_frame() that the port needs
@@ -134,6 +143,7 @@ static void mmal_control_port_cb (MMAL_PORT_T * port,
     MMAL_BUFFER_HEADER_T * buffer);
 static void mmal_input_port_cb (MMAL_PORT_T * port,
     MMAL_BUFFER_HEADER_T * buffer);
+static void mmal_connection_cb (MMAL_CONNECTION_T * connection);
 
 static void mmal_scale_rect (const VideoWindow * vw, MMAL_RECT_T * rect);
 
@@ -143,6 +153,11 @@ static gboolean gst_mmal_video_sink_set_render_rectangle (GstMMALVideoSink *
 static void gst_mmal_video_sink_set_format (MMAL_ES_FORMAT_T * format,
     GstVideoInfo * vinfo, gboolean opaque);
 
+static MMAL_COMPONENT_T *gst_mmal_video_sink_create_component (GstMMALVideoSink
+    * self, const gchar * name);
+
+static MMAL_CONNECTION_T *gst_mmal_video_sink_connect_ports (GstMMALVideoSink *
+    self, MMAL_PORT_T * out, MMAL_PORT_T * in);
 
 static void gst_mmal_video_sink_get_property (GObject * object, guint prop_id,
     GValue * value, GParamSpec * pspec);
@@ -158,12 +173,19 @@ static gboolean gst_mmal_video_sink_propose_allocation (GstBaseSink * sink,
 static gboolean gst_mmal_video_sink_start (GstBaseSink * sink);
 static gboolean gst_mmal_video_sink_stop (GstBaseSink * sink);
 
+static GstFlowReturn gst_mmal_video_sink_prepare (GstBaseSink * sink,
+    GstBuffer * buffer);
+
 static GstFlowReturn gst_mmal_video_sink_show_frame (GstVideoSink * videosink,
     GstBuffer * buffer);
 
 static gboolean gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self);
-static gboolean gst_mmal_video_sink_configure_renderer (GstMMALVideoSink *
-    self, gboolean opaque);
+static gboolean gst_mmal_video_sink_configure (GstMMALVideoSink * self,
+    gboolean opaque);
+
+static void gst_mmal_video_sink_disable_scheduler (GstMMALVideoSink * self);
+static gboolean gst_mmal_video_sink_enable_scheduler (GstMMALVideoSink * self);
+
 static void gst_mmal_video_sink_disable_renderer (GstMMALVideoSink * self);
 static gboolean gst_mmal_video_sink_enable_renderer (GstMMALVideoSink * self);
 
@@ -207,6 +229,7 @@ gst_mmal_video_sink_class_init (GstMMALVideoSinkClass * klass)
   basesink_class->set_caps = GST_DEBUG_FUNCPTR (gst_mmal_video_sink_set_caps);
   basesink_class->start = GST_DEBUG_FUNCPTR (gst_mmal_video_sink_start);
   basesink_class->stop = GST_DEBUG_FUNCPTR (gst_mmal_video_sink_stop);
+  basesink_class->prepare = GST_DEBUG_FUNCPTR (gst_mmal_video_sink_prepare);
   basesink_class->propose_allocation =
       GST_DEBUG_FUNCPTR (gst_mmal_video_sink_propose_allocation);
 
@@ -376,6 +399,19 @@ mmal_input_port_cb (MMAL_PORT_T * port, MMAL_BUFFER_HEADER_T * buffer)
 }
 
 static void
+mmal_connection_cb (MMAL_CONNECTION_T * connection)
+{
+  GstMMALVideoSink *self = NULL;
+
+  g_return_if_fail (connection != NULL);
+  g_return_if_fail (connection->user_data != NULL);
+
+  self = GST_MMAL_VIDEO_SINK (connection->user_data);
+
+  GST_DEBUG_OBJECT (self, "connection callback %s", connection->name);
+}
+
+static void
 gst_mmal_video_sink_init (GstMMALVideoSink * self)
 {
   g_return_if_fail (self != NULL);
@@ -383,7 +419,13 @@ gst_mmal_video_sink_init (GstMMALVideoSink * self)
   gst_video_info_init (&self->vinfo);
   self->vinfo_padded = NULL;
 
+  self->scheduler = NULL;
   self->renderer = NULL;
+
+  self->connection = NULL;
+
+  self->clk = NULL;
+
   self->pool = NULL;
 
   self->need_reconfigure = TRUE;
@@ -398,6 +440,9 @@ gst_mmal_video_sink_init (GstMMALVideoSink * self)
   self->window.y = 0.0;
   self->window.width = 1.0;
   self->window.height = 1.0;
+
+  /* using MMAL scheduler */
+  gst_base_sink_set_sync (GST_BASE_SINK (self), FALSE);
 }
 
 static void
@@ -485,6 +530,48 @@ gst_mmal_video_sink_set_format (MMAL_ES_FORMAT_T * format, GstVideoInfo * vinfo,
   format->flags = MMAL_ES_FORMAT_FLAG_FRAMED;
 }
 
+static MMAL_COMPONENT_T *
+gst_mmal_video_sink_create_component (GstMMALVideoSink * self,
+    const gchar * name)
+{
+  MMAL_COMPONENT_T *component = NULL;
+  MMAL_STATUS_T status;
+
+  g_return_val_if_fail (self != NULL, NULL);
+  g_return_val_if_fail (name != NULL, NULL);
+
+  status = mmal_component_create (name, &component);
+
+  if (status != MMAL_SUCCESS) {
+    GST_ERROR_OBJECT (self, "Failed to create MMAL component %s: %s (%u)", name,
+        mmal_status_to_string (status), status);
+    return NULL;
+  }
+
+  return component;
+}
+
+static MMAL_CONNECTION_T *
+gst_mmal_video_sink_connect_ports (GstMMALVideoSink * self,
+    MMAL_PORT_T * out, MMAL_PORT_T * in)
+{
+  MMAL_CONNECTION_T *connection = NULL;
+  MMAL_STATUS_T status;
+
+  g_return_val_if_fail (self != NULL, NULL);
+  g_return_val_if_fail (out != NULL && in != NULL, NULL);
+
+  status = mmal_connection_create (&connection, out, in,
+      MMAL_CONNECTION_FLAG_TUNNELLING);
+
+  if (status != MMAL_SUCCESS) {
+    GST_ERROR_OBJECT (self, "Failed to connect MMAL ports %s and %s: %s (%u)",
+        out->name, in->name, mmal_status_to_string (status), status);
+    return NULL;
+  }
+
+  return connection;
+}
 
 static gboolean
 gst_mmal_video_sink_propose_allocation (GstBaseSink * sink, GstQuery * query)
@@ -613,17 +700,33 @@ gst_mmal_video_sink_start (GstBaseSink * sink)
 
   bcm_host_init ();
 
-  status =
-      mmal_component_create (MMAL_COMPONENT_DEFAULT_VIDEO_RENDERER,
-      &self->renderer);
+  self->scheduler = gst_mmal_video_sink_create_component (self,
+      MMAL_COMPONENT_DEFAULT_SCHEDULER);
 
+  self->renderer = gst_mmal_video_sink_create_component (self,
+      MMAL_COMPONENT_DEFAULT_VIDEO_RENDERER);
+
+  if (!self->scheduler || !self->renderer) {
+    return FALSE;
+  }
+
+  status = mmal_port_parameter_set_boolean (self->scheduler->clock[0],
+      MMAL_PARAMETER_CLOCK_REFERENCE, MMAL_TRUE);
   if (status != MMAL_SUCCESS) {
-    GST_ERROR_OBJECT (self,
-        "Failed to create MMAL renderer component %s: %s (%u)",
-        MMAL_COMPONENT_DEFAULT_VIDEO_RENDERER,
+    GST_ERROR_OBJECT (self, "Failed to set clock reference: %s (%u)",
         mmal_status_to_string (status), status);
     return FALSE;
   }
+
+  status = mmal_port_parameter_set_boolean (self->scheduler->clock[0],
+      MMAL_PARAMETER_CLOCK_ACTIVE, MMAL_TRUE);
+  if (status != MMAL_SUCCESS) {
+    GST_ERROR_OBJECT (self, "Failed to set clock active: %s (%u)",
+        mmal_status_to_string (status), status);
+    return FALSE;
+  }
+
+  self->clk = gst_mmal_clock_new ("mmal-clock", self->scheduler);
 
   self->allocator = g_object_new (gst_mmal_opaque_allocator_get_type (), NULL);
 
@@ -637,7 +740,7 @@ gst_mmal_video_sink_start (GstBaseSink * sink)
   /* Enable tvservice callback for proper display resolution update support */
   vc_tv_register_callback (gst_mmal_video_sink_tvservice_callback, self);
 
-  return TRUE;
+  return gst_mmal_video_sink_enable_renderer (self);
 }
 
 static gboolean
@@ -654,16 +757,32 @@ gst_mmal_video_sink_stop (GstBaseSink * sink)
 
   vc_tv_unregister_callback (gst_mmal_video_sink_tvservice_callback);
 
+  if (self->connection) {
+    mmal_connection_release (self->connection);
+    self->connection = NULL;
+  }
+
   gst_mmal_video_sink_disable_renderer (self);
+  gst_mmal_video_sink_disable_scheduler (self);
 
   if (self->pool) {
-    mmal_port_pool_destroy (self->renderer->input[0], self->pool);
+    mmal_port_pool_destroy (self->scheduler->input[0], self->pool);
     self->pool = NULL;
+  }
+
+  if (self->clk) {
+    gst_object_unref (self->clk);
+    self->clk = NULL;
   }
 
   if (self->renderer) {
     mmal_component_release (self->renderer);
     self->renderer = NULL;
+  }
+
+  if (self->scheduler) {
+    mmal_component_release (self->scheduler);
+    self->scheduler = NULL;
   }
 
   bcm_host_deinit ();
@@ -714,10 +833,18 @@ gst_mmal_video_sink_copy_frame_raw (guint8 * dest, GstVideoInfo * dinfo,
 }
 
 static GstFlowReturn
-gst_mmal_video_sink_show_frame (GstVideoSink * sink, GstBuffer * buffer)
+gst_mmal_video_sink_prepare (GstBaseSink * sink, GstBuffer * buffer)
 {
   MMAL_STATUS_T status;
   MMAL_BUFFER_HEADER_T *mmal_buf = NULL;
+
+  GstClock *clk;
+  GstClockTime clk_time;
+
+  GstClockTime pts, running_time;
+
+  GstClockTime latency, render_delay;
+  GstClockTimeDiff ts_offset;
 
   GstMMALVideoSink *self;
 
@@ -725,9 +852,39 @@ gst_mmal_video_sink_show_frame (GstVideoSink * sink, GstBuffer * buffer)
   g_return_val_if_fail (buffer != NULL, GST_FLOW_ERROR);
 
   self = GST_MMAL_VIDEO_SINK (sink);
-  GST_TRACE_OBJECT (sink, "show frame");
 
-  GST_DEBUG_OBJECT (sink, "buffer: %p", buffer);
+  pts = GST_BUFFER_PTS (buffer);
+
+  running_time =
+      gst_segment_to_running_time (&sink->segment, GST_FORMAT_TIME, pts);
+
+  /* See gst_base_sink_adjust_time() */
+  latency = gst_base_sink_get_latency (sink);
+  render_delay = gst_base_sink_get_render_delay (sink);
+  ts_offset = gst_base_sink_get_ts_offset (sink);
+
+  running_time += latency;
+
+  if (ts_offset < 0) {
+    ts_offset = -ts_offset;
+    if ((GstClockTime) ts_offset < running_time) {
+      running_time -= ts_offset;
+    } else {
+      running_time = 0;
+    }
+  } else {
+    running_time += ts_offset;
+  }
+
+  if (running_time > render_delay) {
+    running_time -= render_delay;
+  } else {
+    running_time = 0;
+  }
+
+  GST_TRACE_OBJECT (sink,
+      "buffer: %p (PTS: %" GST_TIME_FORMAT ", running: %" GST_TIME_FORMAT,
+      buffer, GST_TIME_ARGS (pts), GST_TIME_ARGS (running_time));
 
   /* Has there just been a caps change? */
   if (self->need_reconfigure) {
@@ -740,11 +897,46 @@ gst_mmal_video_sink_show_frame (GstVideoSink * sink, GstBuffer * buffer)
       /* N.B. configure_renderer() cares if we're switching buffer type:
          plain <-> opaque.  It will set new self->opaque value.
        */
-      if (!gst_mmal_video_sink_configure_renderer (self, opaque)) {
+      if (!gst_mmal_video_sink_configure (self, opaque)) {
 
         GST_ERROR_OBJECT (self, "Reconfigure failed!");
         return GST_FLOW_ERROR;
       }
+    }
+  }
+
+  clk = GST_ELEMENT_CLOCK (sink);
+  clk_time = clk ? gst_clock_get_time (clk) : GST_CLOCK_TIME_NONE;
+
+  /* It is important to set MMAL media time to MMAL_TIME_UNKNOWN initially if
+     later clk happens to be our own MMAL clock.  Otherwise whole scheduling
+     goes crazy.  This is not the case if there's other reasonable clock
+     provided (eg. from audio sink) but this logic works for all cases.
+   */
+  status =
+      mmal_port_parameter_set_uint64 (self->scheduler->clock[0],
+      MMAL_PARAMETER_CLOCK_TIME, GST_CLOCK_TIME_IS_VALID (clk_time) ?
+      GST_TIME_AS_USECONDS (clk_time) : MMAL_TIME_UNKNOWN);
+
+  if (G_UNLIKELY (status != MMAL_SUCCESS)) {
+    GST_WARNING_OBJECT (self, "Failed to set MMAL media time: %s (%u)",
+        mmal_status_to_string (status), status);
+  }
+
+  if (gst_debug_category_get_threshold (GST_CAT_DEFAULT) >= GST_LEVEL_WARNING &&
+      GST_ELEMENT_CLOCK (sink)) {
+
+    GstClockTime vc_time = gst_clock_get_time (self->clk);
+
+    GST_TRACE_OBJECT (sink,
+        "gst clk: %" GST_TIME_FORMAT ", mmal clk: %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (clk_time), GST_TIME_ARGS (vc_time));
+
+    if (G_LIKELY (running_time > vc_time)) {
+      GST_TRACE_OBJECT (self, "Buffer time OK");
+    } else {
+      GST_WARNING_OBJECT (self, "Buffer is late by %" GST_TIME_FORMAT,
+          GST_TIME_ARGS (vc_time - running_time));
     }
   }
 
@@ -823,15 +1015,14 @@ gst_mmal_video_sink_show_frame (GstVideoSink * sink, GstBuffer * buffer)
       mmal_buf->length = mb->map_info.size;
       mmal_buf->user_data = mb;
     }
-
-    mmal_buf->pts = GST_BUFFER_PTS_IS_VALID (buffer) ?
-        GST_TIME_AS_USECONDS (GST_BUFFER_PTS (buffer)) : MMAL_TIME_UNKNOWN;
-    mmal_buf->dts = GST_BUFFER_DTS_IS_VALID (buffer) ?
-        GST_TIME_AS_USECONDS (GST_BUFFER_DTS (buffer)) : MMAL_TIME_UNKNOWN;
-    mmal_buf->flags = MMAL_BUFFER_HEADER_FLAG_FRAME;
   }
 
-  status = mmal_port_send_buffer (self->renderer->input[0], mmal_buf);
+  mmal_buf->pts = GST_CLOCK_TIME_IS_VALID (running_time) ?
+      GST_TIME_AS_USECONDS (running_time) : MMAL_TIME_UNKNOWN;
+  mmal_buf->dts = MMAL_TIME_UNKNOWN;
+  mmal_buf->flags = MMAL_BUFFER_HEADER_FLAG_FRAME;
+
+  status = mmal_port_send_buffer (self->scheduler->input[0], mmal_buf);
   if (status != MMAL_SUCCESS) {
     GST_ERROR_OBJECT (self, "Failed to send MMAL buffer: %s (%u)",
         mmal_status_to_string (status), status);
@@ -846,6 +1037,12 @@ error_map_buffer:
   return GST_FLOW_ERROR;
 }
 
+static GstFlowReturn
+gst_mmal_video_sink_show_frame (GstVideoSink * sink, GstBuffer * buffer)
+{
+  return GST_FLOW_OK;
+}
+
 static gboolean
 gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self)
 {
@@ -857,10 +1054,10 @@ gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self)
 
   vinfo = &self->vinfo;
 
-  g_return_val_if_fail (self->renderer != NULL, FALSE);
-  g_return_val_if_fail (self->renderer->input != NULL, FALSE);
+  g_return_val_if_fail (self->scheduler != NULL, FALSE);
+  g_return_val_if_fail (self->scheduler->input != NULL, FALSE);
 
-  input = self->renderer->input[0];
+  input = self->scheduler->input[0];
   g_return_val_if_fail (input != NULL, FALSE);
 
   GST_DEBUG_OBJECT (self, "buffers recommended: %u",
@@ -915,18 +1112,17 @@ gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self)
 }
 
 static gboolean
-gst_mmal_video_sink_configure_renderer (GstMMALVideoSink * self,
-    gboolean opaque)
+gst_mmal_video_sink_configure (GstMMALVideoSink * self, gboolean opaque)
 {
-  MMAL_PORT_T *input = NULL;
+  MMAL_PORT_T *input = NULL, *output = NULL;
   MMAL_STATUS_T status;
   gboolean configured = FALSE;
 
   g_return_val_if_fail (self != NULL, FALSE);
-  g_return_val_if_fail (self->renderer != NULL, FALSE);
-  g_return_val_if_fail (self->renderer->input != NULL, FALSE);
+  g_return_val_if_fail (self->scheduler != NULL, FALSE);
+  g_return_val_if_fail (self->scheduler->input != NULL, FALSE);
 
-  input = self->renderer->input[0];
+  input = self->scheduler->input[0];
   g_return_val_if_fail (input != NULL, FALSE);
 
   /* We would like to avoid disabling port if at all possible.  This is
@@ -937,15 +1133,15 @@ gst_mmal_video_sink_configure_renderer (GstMMALVideoSink * self,
    */
   if (!mmal_port_supports_format_change (input)) {
 
-    gst_mmal_video_sink_disable_renderer (self);
+    gst_mmal_video_sink_disable_scheduler (self);
 
   } else if (opaque != self->opaque) {
 
     GST_DEBUG_OBJECT (self, "Changing buffer type, we have to disable port.");
 
-    if (self->renderer->input[0]->is_enabled) {
-      mmal_port_disable (self->renderer->input[0]);
-      mmal_port_flush (self->renderer->input[0]);
+    if (input->is_enabled) {
+      mmal_port_disable (input);
+      mmal_port_flush (input);
     }
   }
 
@@ -971,15 +1167,145 @@ gst_mmal_video_sink_configure_renderer (GstMMALVideoSink * self,
     return FALSE;
   }
 
+  if (G_UNLIKELY (!self->connection)) {
+    output = self->scheduler->output[0];
+  } else {
+    output = self->renderer->input[0];
+  }
+
+  mmal_format_full_copy (output->format, input->format);
+
+  status = mmal_port_format_commit (output);
+
+  if (status != MMAL_SUCCESS) {
+    GST_ERROR_OBJECT (self, "Failed to commit output format: %s (%u)",
+        mmal_status_to_string (status), status);
+    return FALSE;
+  }
+
+  if (G_UNLIKELY (!self->connection)) {
+    self->connection = gst_mmal_video_sink_connect_ports (self,
+        self->scheduler->output[0], self->renderer->input[0]);
+
+    if (!self->connection) {
+      return FALSE;
+    }
+  }
+
+  if (!self->connection->is_enabled) {
+    self->connection->user_data = self;
+    self->connection->callback = mmal_connection_cb;
+
+    status = mmal_connection_enable (self->connection);
+    if (status != MMAL_SUCCESS) {
+      GST_ERROR_OBJECT (self, "Failed to enable connection: %s (%u)",
+          mmal_status_to_string (status), status);
+      return FALSE;
+    }
+  }
+
   /* N.B. we don't need a pool for opaque, but we should destroy existing one
      if we have it.
    */
   configured = gst_mmal_video_sink_configure_pool (self) &&
-      gst_mmal_video_sink_enable_renderer (self);
+      gst_mmal_video_sink_enable_scheduler (self);
 
   self->need_reconfigure = !configured;
 
   return configured;
+}
+
+static void
+gst_mmal_video_sink_disable_scheduler (GstMMALVideoSink * self)
+{
+  g_return_if_fail (self != NULL);
+
+  if (self->scheduler) {
+    g_return_if_fail (self->scheduler->control != NULL);
+
+    if (self->scheduler->control->is_enabled) {
+      mmal_port_disable (self->scheduler->control);
+    }
+
+    g_return_if_fail (self->scheduler->input != NULL);
+    g_return_if_fail (self->scheduler->input[0] != NULL);
+
+    if (self->scheduler->input[0]->is_enabled) {
+      mmal_port_disable (self->scheduler->input[0]);
+    }
+
+    if (self->scheduler->is_enabled) {
+      mmal_component_disable (self->scheduler);
+    }
+  }
+}
+
+static gboolean
+gst_mmal_video_sink_enable_scheduler (GstMMALVideoSink * self)
+{
+  MMAL_PORT_T *input = NULL;
+  MMAL_STATUS_T status;
+
+  g_return_val_if_fail (self != NULL, FALSE);
+
+  if (self->scheduler) {
+    g_return_val_if_fail (self->scheduler->control != NULL, FALSE);
+
+    if (!self->scheduler->control->is_enabled) {
+      self->scheduler->control->userdata = (struct MMAL_PORT_USERDATA_T *) self;
+
+      status =
+          mmal_port_enable (self->scheduler->control, mmal_control_port_cb);
+      if (status != MMAL_SUCCESS) {
+        GST_ERROR_OBJECT (self,
+            "Failed to enable control port %s: %s (%u)",
+            self->scheduler->control->name, mmal_status_to_string (status),
+            status);
+        return FALSE;
+      }
+    }
+
+    g_return_val_if_fail (self->scheduler->input != NULL, FALSE);
+
+    input = self->scheduler->input[0];
+    g_return_val_if_fail (input != NULL, FALSE);
+
+    if (!input->is_enabled) {
+      input->userdata = (struct MMAL_PORT_USERDATA_T *) self;
+
+      status = mmal_port_enable (input, mmal_input_port_cb);
+      if (status != MMAL_SUCCESS) {
+        GST_ERROR_OBJECT (self,
+            "Failed to enable input port %s: %s (%u)",
+            input->name, mmal_status_to_string (status), status);
+        return FALSE;
+      }
+    }
+
+    if (!self->scheduler->clock[0]->is_enabled) {
+      input->userdata = (struct MMAL_PORT_USERDATA_T *) self;
+
+      status = mmal_port_enable (self->scheduler->clock[0], mmal_input_port_cb);
+      if (status != MMAL_SUCCESS) {
+        GST_ERROR_OBJECT (self,
+            "Failed to enable input port %s: %s (%u)",
+            input->name, mmal_status_to_string (status), status);
+        return FALSE;
+      }
+    }
+
+    if (!self->scheduler->is_enabled) {
+      status = mmal_component_enable (self->scheduler);
+      if (status != MMAL_SUCCESS) {
+        GST_ERROR_OBJECT (self,
+            "Failed to enable scheduler component: %s (%u)",
+            mmal_status_to_string (status), status);
+        return FALSE;
+      }
+    }
+  }
+
+  return TRUE;
 }
 
 static void
@@ -994,13 +1320,6 @@ gst_mmal_video_sink_disable_renderer (GstMMALVideoSink * self)
       mmal_port_disable (self->renderer->control);
     }
 
-    g_return_if_fail (self->renderer->input != NULL);
-    g_return_if_fail (self->renderer->input[0] != NULL);
-
-    if (self->renderer->input[0]->is_enabled) {
-      mmal_port_disable (self->renderer->input[0]);
-    }
-
     if (self->renderer->is_enabled) {
       mmal_component_disable (self->renderer);
     }
@@ -1010,7 +1329,6 @@ gst_mmal_video_sink_disable_renderer (GstMMALVideoSink * self)
 static gboolean
 gst_mmal_video_sink_enable_renderer (GstMMALVideoSink * self)
 {
-  MMAL_PORT_T *input = NULL;
   MMAL_STATUS_T status;
 
   g_return_val_if_fail (self != NULL, FALSE);
@@ -1027,23 +1345,6 @@ gst_mmal_video_sink_enable_renderer (GstMMALVideoSink * self)
             "Failed to enable control port %s: %s (%u)",
             self->renderer->control->name, mmal_status_to_string (status),
             status);
-        return FALSE;
-      }
-    }
-
-    g_return_val_if_fail (self->renderer->input != NULL, FALSE);
-
-    input = self->renderer->input[0];
-    g_return_val_if_fail (input != NULL, FALSE);
-
-    if (!input->is_enabled) {
-      input->userdata = (struct MMAL_PORT_USERDATA_T *) self;
-
-      status = mmal_port_enable (input, mmal_input_port_cb);
-      if (status != MMAL_SUCCESS) {
-        GST_ERROR_OBJECT (self,
-            "Failed to enable input port %s: %s (%u)",
-            input->name, mmal_status_to_string (status), status);
         return FALSE;
       }
     }

@@ -255,7 +255,8 @@ static gboolean gst_mmal_deinterlace_start (GstMMALDeinterlace * self);
 static gboolean gst_mmal_deinterlace_stop (GstMMALDeinterlace * self);
 
 static GstFlowReturn gst_mmal_deinterlace_drain (GstMMALDeinterlace * self);
-static gboolean gst_mmal_deinterlace_flush (GstMMALDeinterlace * self);
+static gboolean gst_mmal_deinterlace_flush (GstMMALDeinterlace * self,
+    gboolean stop);
 
 static gboolean gst_mmal_deinterlace_ports_enable (GstMMALDeinterlace * self);
 static gboolean gst_mmal_deinterlace_ports_disable (GstMMALDeinterlace * self);
@@ -813,7 +814,7 @@ gst_mmal_deinterlace_sink_event (GstPad * pad, GstObject * parent,
 
     case GST_EVENT_FLUSH_STOP:
       GST_MMAL_DEINTERLACE_STREAM_LOCK (self);
-      ret = gst_mmal_deinterlace_flush (self);
+      ret = gst_mmal_deinterlace_flush (self, FALSE);
       GST_MMAL_DEINTERLACE_STREAM_UNLOCK (self);
 
       ret = ret && gst_pad_push_event (self->src_pad, event);
@@ -1604,7 +1605,7 @@ gst_mmal_deinterlace_stop (GstMMALDeinterlace * self)
 {
   GST_DEBUG_OBJECT (self, "Stopping deinterlacer");
 
-  gst_mmal_deinterlace_flush (self);
+  gst_mmal_deinterlace_flush (self, TRUE);
 
   self->output_flow_ret = GST_FLOW_FLUSHING;
 
@@ -1651,13 +1652,11 @@ gst_mmal_deinterlace_stop (GstMMALDeinterlace * self)
  * next call to handle_frame().
  */
 static gboolean
-gst_mmal_deinterlace_flush (GstMMALDeinterlace * self)
+gst_mmal_deinterlace_flush (GstMMALDeinterlace * self, gboolean stop)
 {
   MMAL_PORT_T *input_port = NULL;
   MMAL_PORT_T *output_port = NULL;
   MMAL_BUFFER_HEADER_T *buffer = NULL;
-  gboolean input_enabled = TRUE;
-  gboolean output_enabled = TRUE;
   gboolean started = self->started;
 
   GstClockTime pts = GST_TIME_AS_USECONDS (self->last_upstream_ts);
@@ -1732,9 +1731,8 @@ gst_mmal_deinterlace_flush (GstMMALDeinterlace * self)
      it's state.
    */
 
-  input_enabled = input_port->is_enabled;
-
-  if (input_enabled && mmal_port_disable (input_port) != MMAL_SUCCESS) {
+  if (stop && input_port->is_enabled &&
+      mmal_port_disable (input_port) != MMAL_SUCCESS) {
     GST_ERROR_OBJECT (self, "Failed to disable input port!");
     goto flush_failed;
   }
@@ -1747,9 +1745,8 @@ gst_mmal_deinterlace_flush (GstMMALDeinterlace * self)
   /* We take this lock to synchronise access to state belonging to output side */
   GST_PAD_STREAM_LOCK (self->src_pad);
 
-  output_enabled = output_port->is_enabled;
-
-  if (output_enabled && mmal_port_disable (output_port) != MMAL_SUCCESS) {
+  if (stop && output_port->is_enabled &&
+      mmal_port_disable (output_port) != MMAL_SUCCESS) {
     GST_ERROR_OBJECT (self, "Failed to disable output port!");
     goto output_flush_failed;
   }
@@ -1768,10 +1765,8 @@ gst_mmal_deinterlace_flush (GstMMALDeinterlace * self)
     }
   }
 
-  gst_mmal_deinterlace_ports_enable (self);
-
-  /* At this point, we expect to have all our buffers back. */
-  {
+  if (stop) {
+    /* At this point, we expect to have all our buffers back. */
     uint32_t input_buffers;
     uint32_t output_buffers;
 

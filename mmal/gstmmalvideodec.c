@@ -108,6 +108,9 @@ static GstFlowReturn gst_mmal_video_dec_send_codec_data (GstMMALVideoDec * self,
 static GstFlowReturn gst_mmal_video_dec_handle_frame (GstVideoDecoder * decoder,
     GstVideoCodecFrame * frame);
 
+static gboolean gst_mmal_video_dec_flush_internal (GstVideoDecoder * decoder,
+    gboolean stop);
+
 static GstFlowReturn gst_mmal_video_dec_finish (GstVideoDecoder * decoder);
 
 static GstFlowReturn gst_mmal_video_dec_drain (GstMMALVideoDec * self);
@@ -384,7 +387,7 @@ gst_mmal_video_dec_stop (GstVideoDecoder * decoder)
   GST_DEBUG_OBJECT (self, "Stopping decoder");
 
   /* Full flush will stop the output side. */
-  gst_mmal_video_dec_flush (decoder);
+  gst_mmal_video_dec_flush_internal (decoder, TRUE);
 
   self->output_flow_ret = GST_FLOW_FLUSHING;
 
@@ -1195,23 +1198,13 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
   return TRUE;
 }
 
-
-/**
- * Called by GstVideoDecoder baseclass flush() function.
- *
- * We ask the decoder to release all buffers it is holding back to us.
- * This also stops the output task thread.  It will be re-started from the
- * next call to handle_frame().
- */
 static gboolean
-gst_mmal_video_dec_flush (GstVideoDecoder * decoder)
+gst_mmal_video_dec_flush_internal (GstVideoDecoder * decoder, gboolean stop)
 {
   GstMMALVideoDec *self = GST_MMAL_VIDEO_DEC (decoder);
   MMAL_PORT_T *input_port = NULL;
   MMAL_PORT_T *output_port = NULL;
   MMAL_BUFFER_HEADER_T *buffer = NULL;
-  gboolean input_enabled = TRUE;
-  gboolean output_enabled = TRUE;
   gboolean started = self->started;
 
   GST_INFO_OBJECT (self, "flushing...");
@@ -1289,9 +1282,8 @@ gst_mmal_video_dec_flush (GstVideoDecoder * decoder)
      it's state.
    */
 
-  input_enabled = input_port->is_enabled;
-
-  if (input_enabled && mmal_port_disable (input_port) != MMAL_SUCCESS) {
+  if (stop && input_port->is_enabled &&
+      mmal_port_disable (input_port) != MMAL_SUCCESS) {
     GST_ERROR_OBJECT (self, "Failed to disable input port!");
     goto flush_failed;
   }
@@ -1304,9 +1296,8 @@ gst_mmal_video_dec_flush (GstVideoDecoder * decoder)
   /* We take this lock to synchronise access to state belonging to output side */
   GST_PAD_STREAM_LOCK (GST_VIDEO_DECODER_SRC_PAD (decoder));
 
-  output_enabled = output_port->is_enabled;
-
-  if (output_enabled && mmal_port_disable (output_port) != MMAL_SUCCESS) {
+  if (stop && output_port->is_enabled &&
+      mmal_port_disable (output_port) != MMAL_SUCCESS) {
     GST_ERROR_OBJECT (self, "Failed to disable output port!");
     goto output_flush_failed;
   }
@@ -1325,22 +1316,8 @@ gst_mmal_video_dec_flush (GstVideoDecoder * decoder)
     }
   }
 
-  if (input_enabled && mmal_port_enable (input_port,
-          &gst_mmal_video_dec_mmal_return_input_buffer_to_pool) !=
-      MMAL_SUCCESS) {
-
-    GST_ERROR_OBJECT (self, "Failed to re-enable input port!");
-    goto output_flush_failed;
-  }
-
-  if (output_enabled && mmal_port_enable (output_port,
-          &gst_mmal_video_dec_mmal_queue_decoded_frame) != MMAL_SUCCESS) {
-    GST_ERROR_OBJECT (self, "Failed to re-enable output port!");
-    goto output_flush_failed;
-  }
-
-  /* At this point, we expect to have all our buffers back. */
-  {
+  if (stop) {
+    /* At this point, we expect to have all our buffers back. */
     uint32_t input_buffers;
     uint32_t output_buffers;
 
@@ -1392,6 +1369,18 @@ flush_failed:
   return FALSE;
 }
 
+/**
+ * Called by GstVideoDecoder baseclass flush() function.
+ *
+ * We ask the decoder to release all buffers it is holding back to us.
+ * This also stops the output task thread.  It will be re-started from the
+ * next call to handle_frame().
+ */
+static gboolean
+gst_mmal_video_dec_flush (GstVideoDecoder * decoder)
+{
+  return gst_mmal_video_dec_flush_internal (decoder, FALSE);
+}
 
 /**
  * This function is adapted from gst-omx.

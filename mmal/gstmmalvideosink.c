@@ -1333,20 +1333,24 @@ gst_mmal_video_sink_configure (GstMMALVideoSink * self, gboolean opaque)
   /* We would like to avoid disabling port if at all possible.  This is
      particularly important when playing adaptive streams so we can achieve
      smooth representation changes.  However, if pipeline is doing
-     something funky to change buffer type after initial negotiation, this
-     requires disable & flush.
+     something funky to change buffer type after initial negotiation, or if
+     format change is not supported without disabling the port, this requires
+     disable & flush.
    */
-  if (!gst_mmal_port_supports_format_change (input)) {
+  if (!gst_mmal_port_supports_format_change (input) ||
+      (self->connection != NULL && opaque != self->opaque)) {
 
-    gst_mmal_video_sink_disable_scheduler (self);
-
-  } else if (opaque != self->opaque) {
-
-    GST_DEBUG_OBJECT (self, "Changing buffer type, we have to disable port.");
+    GST_WARNING_OBJECT (self, "Input port needs to be disabled and flushed.");
 
     if (input->is_enabled) {
       mmal_port_disable (input);
       mmal_port_flush (input);
+    }
+
+    if (opaque != self->opaque) {
+      GST_ERROR_OBJECT (self,
+          "TODO: Switching between plain and opaque not supported");
+      return FALSE;
     }
   }
 

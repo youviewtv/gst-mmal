@@ -2136,6 +2136,10 @@ gst_mmal_video_dec_output_task_loop (GstMMALVideoDec * self)
                         FALSE)) != GST_FLOW_OK) {
               GST_ERROR_OBJECT (self, "Failed to reconfigure output port.");
             }
+
+            GST_ERROR_OBJECT (self,
+                "TODO: Switching between plain and opaque not supported");
+            flow_ret = GST_FLOW_ERROR;
           }
         }
 

@@ -470,6 +470,8 @@ gst_mmal_video_dec_stop (GstVideoDecoder * decoder)
 
   GST_DEBUG_OBJECT (self, "Disabling input port...");
 
+  gst_video_decoder_set_needs_format (decoder, FALSE);
+
   /* Disable ports and free-up buffer pools. */
   if (self->dec->input[0]->is_enabled &&
       mmal_port_disable (self->dec->input[0]) != MMAL_SUCCESS) {
@@ -1130,11 +1132,20 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
 
     GST_INFO_OBJECT (self, "The input format has changed.  Reconfiguring...");
 
+    if (self->input_state != NULL) {
+      gst_video_codec_state_unref (self->input_state);
+      self->input_state = NULL;
+    }
+
+    self->input_state = gst_video_codec_state_ref (state);
+
     GST_DEBUG_OBJECT (self, "Draining decoder...");
 
     flow_ret = gst_mmal_video_dec_drain (self);
     if (flow_ret == GST_FLOW_FLUSHING) {
 
+      GST_DEBUG_OBJECT (self, "Flushing: deferring format change...");
+      gst_video_decoder_set_needs_format (decoder, TRUE);
       return TRUE;
     } else if (flow_ret != GST_FLOW_OK) {
 
@@ -1160,13 +1171,6 @@ gst_mmal_video_dec_set_format (GstVideoDecoder * decoder,
     }
 
     gst_buffer_replace (&self->codec_data, state->codec_data);
-
-    if (self->input_state != NULL) {
-      gst_video_codec_state_unref (self->input_state);
-      self->input_state = NULL;
-    }
-
-    self->input_state = gst_video_codec_state_ref (state);
 
     input_format->es->video.crop.x = 0;
     input_format->es->video.crop.y = 0;
@@ -1282,6 +1286,20 @@ gst_mmal_video_dec_sink_event (GstVideoDecoder * decoder, GstEvent * event)
     case GST_EVENT_FLUSH_STOP:
       GST_VIDEO_DECODER_STREAM_LOCK (decoder);
       ret = ret && gst_mmal_video_dec_flush_stop (self, FALSE);
+      if (ret && gst_video_decoder_get_needs_format (decoder)) {
+
+        GstVideoCodecState *state = self->input_state;
+
+        g_return_val_if_fail (self->input_state != NULL, FALSE);
+
+        ret = gst_mmal_video_dec_set_format (decoder,
+            gst_video_codec_state_ref (state));
+        gst_video_codec_state_unref (state);
+
+        if (ret) {
+          gst_video_decoder_set_needs_format (decoder, FALSE);
+        }
+      }
       GST_VIDEO_DECODER_STREAM_UNLOCK (decoder);
       break;
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015, YouView TV Ltd.
+ * Copyright (C) 2016, YouView TV Ltd.
  *   Author: John Sadler <john.sadler@youview.com>
  *
  * This library is free software; you can redistribute it and/or

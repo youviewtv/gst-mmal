@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015, YouView TV Ltd.
+ * Copyright (C) 2016, YouView TV Ltd.
  *   Author: John Sadler <john.sadler@youview.com>
  *           Tomasz Szkutkowski <tomasz.szkutkowski@youview.com>
  *

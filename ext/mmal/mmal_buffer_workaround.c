@@ -1,7 +1,7 @@
 /*
 Copyright (c) 2012, Broadcom Europe Ltd
 All rights reserved.
-Copyright (C) 2015, YouView TV Ltd.
+Copyright (C) 2016, YouView TV Ltd.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:

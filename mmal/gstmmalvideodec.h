@@ -88,6 +88,9 @@ struct _GstMMALVideoDec
    */
   gboolean caps_changed;
 
+  MMAL_POOL_T *output_buffer_pool_opaque;
+  MMAL_POOL_T *output_buffer_pool_plain;
+
   MMAL_POOL_T *output_buffer_pool;
   MMAL_QUEUE_T *decoded_frames_queue;
 

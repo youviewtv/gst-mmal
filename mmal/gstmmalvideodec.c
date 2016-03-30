@@ -200,6 +200,8 @@ gst_mmal_video_dec_init (GstMMALVideoDec * self)
   self->last_upstream_ts = 0;
 
   self->caps_changed = FALSE;
+  self->output_buffer_pool_opaque = NULL;
+  self->output_buffer_pool_plain = NULL;
   self->output_buffer_pool = NULL;
   self->decoded_frames_queue = NULL;
   self->output_buffer_flags = 0;
@@ -435,10 +437,18 @@ gst_mmal_video_dec_stop (GstVideoDecoder * decoder)
 
   GST_DEBUG_OBJECT (self, "Freeing output buffer pool");
 
-  if (self->output_buffer_pool != NULL) {
-    mmal_port_pool_destroy (self->dec->output[0], self->output_buffer_pool);
-    self->output_buffer_pool = NULL;
+  if (self->output_buffer_pool_opaque != NULL) {
+    mmal_port_pool_destroy (self->dec->output[0],
+        self->output_buffer_pool_opaque);
+    self->output_buffer_pool_opaque = NULL;
   }
+
+  if (self->output_buffer_pool_plain != NULL) {
+    mmal_pool_destroy (self->output_buffer_pool_plain);
+    self->output_buffer_pool_plain = NULL;
+  }
+
+  self->output_buffer_pool = NULL;
 
   GST_PAD_STREAM_UNLOCK (GST_VIDEO_DECODER_SRC_PAD (self));
 
@@ -1783,10 +1793,19 @@ gst_mmal_video_dec_output_reconfigure_output_port (GstMMALVideoDec * self,
 
   GST_DEBUG_OBJECT (self, "Reconfiguring output buffer pool...");
 
-  if (!self->output_buffer_pool) {
-    self->output_buffer_pool = mmal_port_pool_create (output_port,
-        GST_MMAL_NUM_OUTPUT_BUFFERS, GST_MMAL_MAX_I420_BUFFER_SIZE);
+  if (self->opaque) {
+    if (!self->output_buffer_pool_opaque) {
+      self->output_buffer_pool_opaque = mmal_port_pool_create (output_port,
+          GST_MMAL_NUM_OUTPUT_BUFFERS, GST_MMAL_MAX_I420_BUFFER_SIZE);
+    }
+  } else if (!self->output_buffer_pool_plain) {
+    self->output_buffer_pool_plain =
+        mmal_pool_create (GST_MMAL_NUM_OUTPUT_BUFFERS,
+        GST_MMAL_MAX_I420_BUFFER_SIZE);
   }
+
+  self->output_buffer_pool = self->opaque ?
+      self->output_buffer_pool_opaque : self->output_buffer_pool_plain;
 
   if (mmal_port_enable (output_port,
           &gst_mmal_video_dec_mmal_queue_decoded_frame) != MMAL_SUCCESS) {

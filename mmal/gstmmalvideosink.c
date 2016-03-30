@@ -1240,7 +1240,30 @@ gst_mmal_video_sink_configure_pool (GstMMALVideoSink * self)
       input->buffer_num_recommended);
 
   input->buffer_num = self->opaque ?
-      GST_MMAL_NUM_OUTPUT_BUFFERS : MMAL_BUFFER_NUM;
+      /* In opaque mode MMAL buffers are allocated upstream.  Each component
+         needs to know the maximum number of buffers it should expect on its
+         input to allocate internal data.  If more buffers than `buffer_num` are
+         sent, ENOMEM is returned.
+
+         There can be MMAL elements upstream that work in pass-through mode and
+         do not allocate/send MMAL buffers.  But if they start processing data,
+         their buffers are received here.  This on its own is not a problem as
+         those elements need the other upstream MMAL buffers to produce their
+         data.  But elements like 'mmaldeinterlace' double the framerate and
+         sent twice as much buffers.  We can end up in a situation when there's
+         `GST_MMAL_NUM_OUTPUT_BUFFERS - 1` buffers queued in the scheduler,
+         'mmaldeinterlace' goes out of pass-through mode after a format change
+         and from the remaining buffer it produces two buffers which result in
+         `GST_MMAL_NUM_OUTPUT_BUFFERS + 1` total buffers sent to the sink which
+         will result in ENOMEM.
+
+         For the reasons described above, we make room for twice as much buffers
+         in the scheduler.  These are actually buffer _headers_ which are cheap
+         to allocate.
+       */
+      GST_MMAL_NUM_OUTPUT_BUFFERS * 2 :
+      /* plain buffers */
+      MMAL_BUFFER_NUM;
   input->buffer_size = GST_MMAL_MAX_I420_BUFFER_SIZE;
 
   /* In opaque case we don't need any pool, but it's possible that we're

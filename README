@@ -1,17 +1,113 @@
 GStreamer MMAL wrapper plugin
---------------------------
+-----------------------------
 
- This plugin wraps available MMAL components and makes
- them available as standard GStreamer elements.
+This plugin wraps available MMAL components and makes them available as standard
+GStreamer elements.
+
+Multi-Media Abstraction Layer (MMAL) is a Broadcom proprietary API to access
+multimedia components running on VideoCore.
+
+The main idea is to use MMAL components and take advantage of MMAL buffer
+headers which either allow to provide data directly in the payload of the header
+or use only a handle to an opaque buffer transferred between MMAL components.
+Ideally all processing is done in MMAL components without any data copied and
+with only opaque buffer headers transferred between GStreamer elements.
+Naturally the first MMAL component needs to initially copy data from GStreamer
+to MMAL.
+
+The goal was to have separate functional elements for better modularity and
+testability and avoid creating functional blobs.
+
+### Memory ###
+
+`GstMemory` and `GstBufferPool` abstractions are used to map MMAL opaque memory
+headers into GStreamer buffers.  Simple wrappers are provided to keep track of
+MMAL buffer headers references transferred as `GstBuffer`.
+
+### Allocation ###
+
+Out of two options, allocating MMAL buffer headers in upstream elements was
+chosen as this seemed easier to implement and reason about.  Requesting
+downstream elements to allocate and provide MMAL buffer headers should be
+possible but is not supported.  Instead it is assumed that upstream elements
+allocate MMAL buffer headers.
+
+MMAL elements negotiate buffer allocation to decide between using plain buffers
+(accepting regular GStreamer buffers) and opaque buffers.
+
+### Clock, scheduling and synchronisation ###
+
+One of the problems of media and clock synchronisation is clock drift.  Devices
+with digital outputs usually have a separate clock for output synchronisation
+which is unlikely synchronised with a clock used to drive the pipeline (usually
+a system clock based on the wall clock).  At the same time simply submitting
+video for rendering means video frames are rendered as soon as they are
+submitted.  If controlled by the wall clock, and considering a drift between the
+wall clock and video output clock, chances are high that there are situations
+when more than one frame is submitted in the same V-Sync period.  This means
+some frames can be discarded (overwritten) in the output without being visible
+for their intended duration which results in video juddering.
+
+To overcome problems described above, `GstMMALClock` (implements
+`GstSystemClock`) is provided by mmalvideosink along with video scheduling in
+mmalvideosink (uses MMAL 'scheduler' component and implements
+`GstVideoSink::prepare()`).  Although MMAL 'scheduler' uses wall clock as well,
+it does so on the VC side.  Also MMAL clock framework compensates any jitter if
+local media time updates are provided (equivalent of GStreamer running time)
+while the scheduler holds a few frames on the VC side.  This all together
+provides smooth playback synchronised with audio.
+
+### Buffer pools and output threads ###
+
+Each MMAL element which has a src pad, creates an MMAL buffer pool for outgoing
+MMAL buffer headers.  This is to satisfy the convention that upstream elements
+provide MMAL buffer headers.  For opaque buffers, pools need to be associated
+with MMAL ports and port configuration determines the actual MMAL buffer size
+and number (extra MMAL parameters can be used to request more real buffers).  To
+overcome problems with port reconfiguration and to ensure smooth transitions
+when playing adaptive streams, pool and buffer sizes are fixated (currently
+maximum supported video resolution is 1920x1080).
+
+To avoid processing any output data on MMAL threads, output processing threads
+are used on src pads.  MMAL output port callbacks only queue results which then
+are picked and sent downstream on the output thread.
+
+Examples:
+---------
+
+    gst-play-1.0 \
+      --videosink 'h264parse ! mmalh264dec ! mmaldeinterlace ! mmalvideosink' \
+      --audiosink alsasink \
+      http://rdmedia.bbc.co.uk/dash/ondemand/testcard/1/client_manifest-events.mpd
 
 License:
 --------
 
-  This package and its contents are licensend under the GNU Lesser General
-Public License (LGPL).
+This package and its contents are licensed under the GNU Lesser General Public
+License (LGPL) version 2.1.
 
 Dependencies:
 -------------
 
- * GStreamer core
- * gst-plugins-base
+* GStreamer core
+* gst-plugins-base
+* MMAL
+
+Limitations:
+------------
+
+*   only limited subset of VC functionality is exposed as GStreamer elements
+
+    More elements can be created and added, e.g. for video encoding etc.
+
+*   mmaldeinterlace does not support MMAL plain buffers
+
+    This is because MMAL 'image_fx' component doesn't seem to support plain
+    buffers neither on its input nor output.
+
+*   no switching between MMAL plain and opaque buffers
+
+    This requires more investigation.  Attempts to switch between opaque and
+    plain buffers causes some hang up on VC side, at least on Raspberry Pi
+    (requires rebooting the device).  Using only plain buffers or only opaque
+    buffers works.

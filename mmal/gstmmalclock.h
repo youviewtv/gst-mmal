@@ -40,6 +40,8 @@ GType gst_mmal_clock_get_type (void);
 
 GstClock * gst_mmal_clock_new (const gchar * name, MMAL_COMPONENT_T * clk);
 
+gboolean gst_mmal_clock_set_master (GstClock * clock, GstClock * master);
+
 G_END_DECLS
 
 #endif /* __GST_MMAL_CLOCK_H__ */

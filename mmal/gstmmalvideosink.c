@@ -47,6 +47,9 @@
 #define MIN_VIDEO_WIDTH_FRACT (1.0 / 8.0)
 #define MIN_VIDEO_HEIGHT_FRACT (1.0 / 8.0)
 
+/* Reasonable value as in GstClock */
+#define DEFAULT_TIMEOUT GST_SECOND / 10
+
 #define GST_MMAL_VIDEO_SINK(obj) \
   (G_TYPE_CHECK_INSTANCE_CAST((obj), GST_TYPE_MMAL_VIDEO_SINK, GstMMALVideoSink))
 
@@ -74,7 +77,11 @@ struct _GstMMALVideoSink
 
   MMAL_CONNECTION_T *connection;
 
+  /* clock provided by this component */
   GstClock *clk;
+
+  /* master clock sampling period */
+  GstClockTime timeout;
 
   MMAL_POOL_T *pool;
 
@@ -119,6 +126,7 @@ enum
   PROP_0,
 
   PROP_DEST_VIDEO_WINDOW_REGION,
+  PROP_TIMEOUT,
 
   PROP_LAST
 };
@@ -175,6 +183,8 @@ static void gst_mmal_video_sink_set_property (GObject * object, guint prop_id,
     const GValue * value, GParamSpec * pspec);
 
 static GstClock *gst_mmal_video_sink_provide_clock (GstElement * element);
+static gboolean gst_mmal_video_sink_set_clock (GstElement * element,
+    GstClock * clock);
 
 static gboolean gst_mmal_video_sink_set_caps (GstBaseSink * sink,
     GstCaps * caps);
@@ -231,6 +241,12 @@ gst_mmal_video_sink_class_init (GstMMALVideoSinkClass * klass)
           "(0.0 to 1.0): x, y, width, height",
           GST_TYPE_STRUCTURE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_TIMEOUT,
+      g_param_spec_uint64 ("timeout", "Timeout",
+          "The amount of time, in nanoseconds, to sample master clock",
+          0, G_MAXUINT64, DEFAULT_TIMEOUT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   gst_element_class_add_pad_template (element_class,
       gst_static_pad_template_get (&sink_template));
 
@@ -243,6 +259,7 @@ gst_mmal_video_sink_class_init (GstMMALVideoSinkClass * klass)
 
   element_class->provide_clock =
       GST_DEBUG_FUNCPTR (gst_mmal_video_sink_provide_clock);
+  element_class->set_clock = GST_DEBUG_FUNCPTR (gst_mmal_video_sink_set_clock);
 
   basesink_class->set_caps = GST_DEBUG_FUNCPTR (gst_mmal_video_sink_set_caps);
   basesink_class->start = GST_DEBUG_FUNCPTR (gst_mmal_video_sink_start);
@@ -446,6 +463,7 @@ gst_mmal_video_sink_init (GstMMALVideoSink * self)
   self->connection = NULL;
 
   self->clk = NULL;
+  self->timeout = DEFAULT_TIMEOUT;
 
   self->pool = NULL;
 
@@ -480,6 +498,10 @@ gst_mmal_video_sink_get_property (GObject * object, guint prop_id,
               "y", G_TYPE_DOUBLE, self->window.y,
               "width", G_TYPE_DOUBLE, self->window.width,
               "height", G_TYPE_DOUBLE, self->window.height, NULL));
+      break;
+
+    case PROP_TIMEOUT:
+      g_value_set_uint64 (value, self->timeout);
       break;
 
     default:
@@ -522,6 +544,10 @@ gst_mmal_video_sink_set_property (GObject * object, guint prop_id,
 
       break;
     }
+
+    case PROP_TIMEOUT:
+      self->timeout = g_value_get_uint64 (value);
+      break;
 
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -714,6 +740,19 @@ gst_mmal_video_sink_provide_clock (GstElement * element)
 }
 
 static gboolean
+gst_mmal_video_sink_set_clock (GstElement * element, GstClock * clock)
+{
+  GstMMALVideoSink *self = GST_MMAL_VIDEO_SINK (element);
+
+  GST_DEBUG_OBJECT (self, "Received clock: %s",
+      clock ? GST_OBJECT_NAME (clock) : "(NULL)");
+
+  return GST_ELEMENT_CLASS (parent_class)->set_clock (element, clock) &&
+      /* our clock might be not initialised yet (start() not called) */
+      (!self->clk || gst_mmal_clock_set_master (self->clk, clock));
+}
+
+static gboolean
 gst_mmal_video_sink_propose_allocation (GstBaseSink * sink, GstQuery * query)
 {
   GstCaps *caps = NULL;
@@ -834,7 +873,10 @@ gst_mmal_video_sink_start (GstBaseSink * sink)
   g_return_val_if_fail (sink != NULL, FALSE);
 
   self = GST_MMAL_VIDEO_SINK (sink);
-  GST_DEBUG_OBJECT (self, "Starting sink...");
+  GST_DEBUG_OBJECT (self, "Starting sink: "
+      "base time: %" GST_TIME_FORMAT ", start time: %" GST_TIME_FORMAT,
+      GST_TIME_ARGS (gst_element_get_base_time (GST_ELEMENT (self))),
+      GST_TIME_ARGS (gst_element_get_start_time (GST_ELEMENT (self))));
 
   gst_video_info_init (&self->vinfo);
 
@@ -858,7 +900,21 @@ gst_mmal_video_sink_start (GstBaseSink * sink)
     return FALSE;
   }
 
+  /*
+   * It's hard to tell from MMAL code why it's needed to set it initially to
+   * "unknown" but without this it gets into a weird state when everything is
+   * out of sync.
+   */
+  status = mmal_port_parameter_set_uint64 (self->scheduler->clock[0],
+      MMAL_PARAMETER_CLOCK_TIME, MMAL_TIME_UNKNOWN);
+  if (status != MMAL_SUCCESS) {
+    GST_ERROR_OBJECT (self, "Failed to initialise MMAL clock: %s (%u)",
+        mmal_status_to_string (status), status);
+    return FALSE;
+  }
+
   self->clk = gst_mmal_clock_new ("mmal-clock", self->scheduler);
+  gst_clock_set_timeout (self->clk, self->timeout);
 
   self->allocator = g_object_new (gst_mmal_opaque_allocator_get_type (), NULL);
 
@@ -876,7 +932,12 @@ gst_mmal_video_sink_start (GstBaseSink * sink)
       gst_mmal_enable_component (self, self->scheduler) &&
       gst_mmal_video_sink_enable_renderer (self) &&
       gst_element_post_message (GST_ELEMENT (self),
-      gst_message_new_clock_provide (GST_OBJECT (self), self->clk, TRUE));
+      gst_message_new_clock_provide (GST_OBJECT (self), self->clk, TRUE)) &&
+      /*
+       * Set the current element's clock as master (might be NULL).  Need to do
+       * this here as the clock might have already been distributed.
+       */
+      gst_mmal_clock_set_master (self->clk, GST_ELEMENT_CLOCK (self));
 }
 
 static gboolean
@@ -981,9 +1042,6 @@ gst_mmal_video_sink_prepare (GstBaseSink * sink, GstBuffer * buffer)
   MMAL_STATUS_T status;
   MMAL_BUFFER_HEADER_T *mmal_buf = NULL;
 
-  GstClock *clk;
-  GstClockTime clk_time;
-
   GstClockTime pts, running_time;
 
   GstClockTime latency, render_delay;
@@ -1049,38 +1107,11 @@ gst_mmal_video_sink_prepare (GstBaseSink * sink, GstBuffer * buffer)
     }
   }
 
-  clk = GST_ELEMENT_CLOCK (sink);
-  clk_time = clk ? gst_clock_get_time (clk) : GST_CLOCK_TIME_NONE;
-
-  /* It is important to set MMAL media time to MMAL_TIME_UNKNOWN initially if
-     later clk happens to be our own MMAL clock.  Otherwise whole scheduling
-     goes crazy.  This is not the case if there's other reasonable clock
-     provided (eg. from audio sink) but this logic works for all cases.
-   */
-  status =
-      mmal_port_parameter_set_uint64 (self->scheduler->clock[0],
-      MMAL_PARAMETER_CLOCK_TIME, GST_CLOCK_TIME_IS_VALID (clk_time) ?
-      GST_TIME_AS_USECONDS (clk_time) : MMAL_TIME_UNKNOWN);
-
-  if (G_UNLIKELY (status != MMAL_SUCCESS)) {
-    GST_WARNING_OBJECT (self, "Failed to set MMAL media time: %s (%u)",
-        mmal_status_to_string (status), status);
-  }
-
-  if (gst_debug_category_get_threshold (GST_CAT_DEFAULT) >= GST_LEVEL_WARNING &&
-      GST_ELEMENT_CLOCK (sink)) {
+  if (gst_debug_category_get_threshold (GST_CAT_DEFAULT) >= GST_LEVEL_WARNING) {
 
     GstClockTime vc_time = gst_clock_get_time (self->clk);
 
-    GST_TRACE_OBJECT (sink,
-        "gst clk: %" GST_TIME_FORMAT ", mmal clk: %" GST_TIME_FORMAT,
-        GST_TIME_ARGS (clk_time), GST_TIME_ARGS (vc_time));
-    GST_TRACE_OBJECT (sink,
-        "base time: %" GST_TIME_FORMAT ", start time: %" GST_TIME_FORMAT,
-        GST_TIME_ARGS (gst_element_get_base_time (GST_ELEMENT (sink))),
-        GST_TIME_ARGS (gst_element_get_start_time (GST_ELEMENT (sink))));
-
-    if (G_LIKELY (running_time > vc_time)) {
+    if (G_LIKELY (running_time >= vc_time)) {
       GST_TRACE_OBJECT (self, "Buffer time OK");
     } else {
       GST_WARNING_OBJECT (self, "Buffer is late by %" GST_TIME_FORMAT,
@@ -1165,6 +1196,16 @@ gst_mmal_video_sink_prepare (GstBaseSink * sink, GstBuffer * buffer)
     }
   }
 
+  /*
+   * If there's any trick-play, play speed change etc., GStreamer uses all sort
+   * of magic and buffer PTS calculation for us so that buffers arriving here
+   * have their PTS set in terms of the running clock (mainly based on segment
+   * information and frame rate), so MMAL sees buffers submitted as they should
+   * be rendered in real (running) time, eg. with with 2x play speed every 2nd
+   * buffer/frame is selected for rendering (decoder handles the magic of
+   * picking the right frames) and PTS on each of them will be set such that
+   * running time lapse and frame rate "match".
+   */
   mmal_buf->pts = GST_CLOCK_TIME_IS_VALID (running_time) ?
       GST_TIME_AS_USECONDS (running_time) : MMAL_TIME_UNKNOWN;
   mmal_buf->dts = MMAL_TIME_UNKNOWN;
